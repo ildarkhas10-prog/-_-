@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 websockets
-google-generativeai
+google-genai
 python-multipart
 
 import json
@@ -10,20 +10,21 @@ from datetime import datetime
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form
 from fastapi.responses import HTMLResponse, JSONResponse
-import google.generativeai as genai
+
+# Новая библиотека Google GenAI SDK
+from google import genai
+from google.genai import types
 
 # =====================================================================
-# НАСТРОЙКА КЛЮЧЕЙ (ДЛЯ ДРУГА НА СЕРВЕРЕ)
-# Строка 15: Вставь ключ Gemini API внутри кавычек
+# СТРОКА 15: ВСТАВИТЬ КЛЮЧ GEMINI ВНУТРИ КАВЫЧЕК
 # =====================================================================
 GEMINI_API_KEY = "<<<ВСТАВИТЬ_СЮДА_КЛЮЧ_GEMINI>>>"
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_ID = "gemini-2.5-flash"  # Самая стабильная мультимодальная модель из списка сервера
 
 app = FastAPI()
 
-# Единое состояние автомобиля (хранится в памяти сервера и синхронизируется у всех)
 car_state = {
     "model": "LADA Vesta NG",
     "ecu": "Итэлма М86",
@@ -37,7 +38,7 @@ car_state = {
     "intake_temp": 24,
     "error_code": "ОК (0000)",
     "alert": False,
-    "sound_trigger": 0,  # 0 - тишина, 1 - перегрев, 2 - сеть, 3 - зажигание, 4 - общая тревога
+    "sound_trigger": 0,
     "ai_banner": "Все узлы LADA Vesta NG работают штатно. Поездка безопасна.",
     "logs": [
         {"title": "Запуск системы «Вектор-Автоваз»", "desc": "Связь с сервером и модулями ESP32 установлена", "time": "12:00"},
@@ -45,13 +46,12 @@ car_state = {
     ]
 }
 
-# Базовые профили для разных типов авто при смене в админке
 CAR_PROFILES = {
-    "LADA": {"ecu": "Итэлма М86 / Январь", "fuel_cap": 50, "norm_temp": 88},
-    "Daewoo Matiz": {"ecu": "Sirius D32 (0.8L)", "fuel_cap": 35, "norm_temp": 85},
-    "Nissan Teana": {"ecu": "Hitachi VQ25 (CVT)", "fuel_cap": 70, "norm_temp": 90},
-    "Opel Corsa": {"ecu": "Bosch Motronic", "fuel_cap": 45, "norm_temp": 92},
-    "Toyota RAV4": {"ecu": "Denso EFI", "fuel_cap": 60, "norm_temp": 87}
+    "LADA": {"ecu": "Итэлма М86 / Январь"},
+    "Daewoo Matiz": {"ecu": "Sirius D32 (0.8L)"},
+    "Nissan Teana": {"ecu": "Hitachi VQ25 (CVT)"},
+    "Opel Corsa": {"ecu": "Bosch Motronic"},
+    "Toyota RAV4": {"ecu": "Denso EFI"}
 }
 
 class ConnectionManager:
@@ -81,10 +81,6 @@ async def get_index():
     with open("index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
-# =====================================================================
-# МАРШРУТ СПЕЦИАЛЬНО ДЛЯ ОБЕИХ ПЛАТ ESP32 (Экран CYD и Аудио-модуль)
-# Отдает легкий JSON по адресу: http://cesium.pro/api/esp
-# =====================================================================
 @app.get("/api/esp")
 async def get_esp_data():
     return JSONResponse({
@@ -117,7 +113,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 car_state.update(new_data)
 
-                # Корректировка ЭБУ при смене марки машины
                 model_name = car_state["model"]
                 if model_name != old_model:
                     if model_name.startswith("LADA"):
@@ -127,11 +122,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     else:
                         car_state["ecu"] = "Bosch / Continental CAN"
 
-                # Авторасчет запаса хода от топлива и нагрузки
                 consumption = 7.5 + (car_state["load"] * 0.08) + (car_state["rpm"] / 2000)
                 car_state["range"] = int((car_state["fuel"] / consumption) * 100)
 
-                # Проверка аварийных режимов и триггеров для ESP32
                 is_alert = (
                     car_state["temp"] >= 105 or
                     car_state["volt"] <= 11.8 or
@@ -152,7 +145,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     else:
                         car_state["sound_trigger"] = 4
 
-                    # Запись в бортжурнал при появлении новой ошибки
                     if car_state["error_code"] != old_err:
                         now_str = datetime.now().strftime("%H:%M")
                         car_state["logs"].insert(0, {
@@ -162,7 +154,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
                         car_state["logs"] = car_state["logs"][:20]
 
-                # Рассылка всем клиентам (Жюри, Проектор, Админ)
                 await manager.broadcast({"type": "state", "data": car_state})
 
     except WebSocketDisconnect:
@@ -171,7 +162,6 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.post("/api/chat")
 async def chat_with_ai(message: str = Form(...), image: UploadFile = File(None)):
     try:
-        # Полный системный контекст автомобиля и СТО для Gemini
         system_context = f"""
         Ты — бортовой интеллектуальный ИИ-диагност российской экосистемы «Вектор-Автоваз».
         [ТЕКУЩИЕ ДАННЫЕ АВТОМОБИЛЯ С ДАТЧИКОВ]
@@ -188,22 +178,35 @@ async def chat_with_ai(message: str = Form(...), image: UploadFile = File(None))
         2. Круглосуточное СТО «Мастер-Моторс 24/7» (Автоэлектрик, эвакуатор) — 4.1 км (11 мин езды), тел: +7 (495) 999-88-77
 
         Правила ответа:
-        1. Отвечай с учетом конкретной модели ({car_state['model']}) и ее конструктивных особенностей (тип мотора, КПП, расположение узлов под капотом).
-        2. Если прислано фото подкапотного пространства — укажи, что ты видишь, куда смотреть водителю, что еще сфотографировать ближе, и предупреди об опасности (например, если температура ОЖ {car_state['temp']}°C высокая — запрети открывать крышку бачка!).
-        3. Давай четкий план действий, называй контакты ближайшего СТО из списка выше и полезные ресурсы (Drive2, Лада.Онлайн).
+        1. Отвечай с учетом конкретной модели ({car_state['model']}) и ее конструктивных особенностей.
+        2. Если прислано фото подкапотного пространства — укажи, что ты видишь, что еще сфотографировать ближе, и предупреди об опасности (если температура ОЖ {car_state['temp']}°C высокая — запрети открывать крышку бачка!).
+        3. Давай четкий план действий, контакты ближайшего СТО из списка выше и полезные ресурсы (Drive2, Лада.Онлайн).
         """
 
         prompt_parts = [system_context, f"Сообщение от водителя: {message}"]
 
         if image and image.filename:
             img_bytes = await image.read()
-            prompt_parts.append({"mime_type": image.content_type or "image/jpeg", "data": img_bytes})
+            prompt_parts.append(
+                types.Part.from_bytes(data=img_bytes, mime_type=image.content_type or "image/jpeg")
+            )
 
-        # Вызов в отдельном потоке, чтобы 1 ядро VPS не блокировало WebSockets
-        response = await asyncio.to_thread(model.generate_content, prompt_parts)
+        # Запрос к Gemini с резервным переключением на gemini-3.5-flash при перегрузке (503)
+        try:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=MODEL_ID,
+                contents=prompt_parts
+            )
+        except Exception:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-3.5-flash",
+                contents=prompt_parts
+            )
+
         reply_text = response.text
 
-        # Если сейчас авария, обновляем краткий баннер на главном экране для всех
         if car_state["alert"]:
             short_summary = reply_text.split('\n')[0][:160]
             car_state["ai_banner"] = short_summary
@@ -211,23 +214,20 @@ async def chat_with_ai(message: str = Form(...), image: UploadFile = File(None))
 
         return {"status": "ok", "reply": reply_text}
     except Exception as e:
-        return {"status": "error", "reply": f"Модуль ИИ временно недоступен (проверьте ключ API на сервере). Детали: {str(e)}"}
+        return {"status": "error", "reply": f"Ошибка ИИ: {str(e)}"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
-
-                      <!DOCTYPE html>
+                        <!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <meta name="theme-color" content="#0b0e14">
   <title>Вектор-Автоваз // Бортовая экосистема</title>
-  <!-- ===================================================================== -->
-  <!-- СТРОКА 10: ДРУГ ВСТАВЛЯЕТ КЛЮЧ ЯНДЕКС JAVASCRIPT API ПОСЛЕ apikey=    -->
-  <!-- ===================================================================== -->
+  <!-- СТРОКА 9: ВСТАВИТЬ КЛЮЧ ЯНДЕКС JAVASCRIPT API ПОСЛЕ apikey= -->
   <script src="https://api-maps.yandex.ru/2.1/?apikey=<<<ВСТАВИТЬ_СЮДА_КЛЮЧ_ЯНДЕКС_JS_API>>>&lang=ru_RU" type="text/javascript"></script>
   <style>
     :root {
@@ -254,7 +254,6 @@ if __name__ == "__main__":
       overflow: hidden;
     }
 
-    /* Навигация (Слева на ПК / Снизу на смартфонах) */
     .nav-bar {
       width: 250px;
       background: var(--bg-sidebar);
@@ -292,7 +291,6 @@ if __name__ == "__main__":
       box-shadow: inset 3px 0 0 var(--accent);
     }
 
-    /* Рабочая область */
     .main-area { flex: 1; display: flex; flex-direction: column; overflow-y: auto; padding: 24px 32px; }
 
     .top-header {
@@ -319,7 +317,6 @@ if __name__ == "__main__":
     .tab-section { display: none; }
     .tab-section.active { display: block; }
 
-    /* Сетка из 9 карточек телеметрии */
     .telemetry-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -346,7 +343,6 @@ if __name__ == "__main__":
       border-left-color: var(--danger);
     }
 
-    /* Полноценный Чат ИИ-Диагноста */
     .chat-box {
       background: var(--bg-card); border: 1px solid var(--border);
       border-radius: 16px; height: 68vh; display: flex; flex-direction: column; overflow: hidden;
@@ -378,7 +374,6 @@ if __name__ == "__main__":
       padding: 0 20px; height: 42px; border-radius: 10px; cursor: pointer;
     }
 
-    /* Карты и СТО */
     .map-wrapper { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
     #map { height: 64vh; border-radius: 16px; border: 1px solid var(--border); overflow: hidden; }
     .sto-list { display: flex; flex-direction: column; gap: 12px; }
@@ -391,7 +386,6 @@ if __name__ == "__main__":
       padding: 10px 14px; border-radius: 10px; text-decoration: none; border: none; cursor: pointer;
     }
 
-    /* Бортжурнал */
     .log-list { display: flex; flex-direction: column; gap: 10px; }
     .log-item {
       background: var(--bg-card); border: 1px solid var(--border);
@@ -399,7 +393,6 @@ if __name__ == "__main__":
     }
     .log-time { font-size: 0.8rem; color: var(--text-muted); }
 
-    /* Скрытая Админка */
     .modal-overlay {
       position: fixed; inset: 0; background: rgba(0,0,0,0.8);
       backdrop-filter: blur(5px); display: none; align-items: center; justify-content: center; z-index: 999;
@@ -482,7 +475,6 @@ if __name__ == "__main__":
       </div>
     </header>
 
-    <!-- ВКЛАДКА 1: 9 ПАРАМЕТРОВ ТЕЛЕМЕТРИИ -->
     <section id="tab-telemetry" class="tab-section active">
       <div class="telemetry-grid">
         <div class="card">
@@ -541,7 +533,6 @@ if __name__ == "__main__":
       </div>
     </section>
 
-    <!-- ВКЛАДКА 2: ИИ-ДИАГНОСТ С ФОТО И ДИНАМИЧЕСКИМИ КНОПКАМИ -->
     <section id="tab-ai" class="tab-section">
       <div class="chat-box">
         <div class="chat-messages" id="chatFeed">
@@ -563,7 +554,6 @@ if __name__ == "__main__":
       </div>
     </section>
 
-    <!-- ВКЛАДКА 3: ЯНДЕКС КАРТА И СТО -->
     <section id="tab-map" class="tab-section">
       <div class="map-wrapper">
         <div id="map"></div>
@@ -584,13 +574,11 @@ if __name__ == "__main__":
       </div>
     </section>
 
-    <!-- ВКЛАДКА 4: БОРТЖУРНАЛ -->
     <section id="tab-log" class="tab-section">
       <div class="log-list" id="uiLogs"></div>
     </section>
   </main>
 
-  <!-- СКРЫТАЯ АДМИНКА (5 кликов по шапке/логотипу, пароль скрыт) -->
   <div class="modal-overlay" id="adminModal">
     <div class="modal">
       <div id="pinView">
@@ -652,7 +640,6 @@ if __name__ == "__main__":
   </div>
 
   <script>
-    // Полный список автомобилей (Вся линейка АвтоВАЗ в топе + популярные авто в России)
     const CAR_LIST = [
       "LADA Vesta NG", "LADA Vesta SW Cross", "LADA Vesta Sportline", "LADA Granta", "LADA Granta Sport",
       "LADA Granta Cross", "LADA Largus", "LADA Largus Cross", "LADA Niva Legend", "LADA Niva Travel",
@@ -680,7 +667,6 @@ if __name__ == "__main__":
       selectEl.appendChild(opt);
     });
 
-    // Подключение по WebSocket к серверу для синхронизации всех клиентов
     let ws;
     function connectWS() {
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -722,10 +708,8 @@ if __name__ == "__main__":
         : 'Экстренное посещение не требуется.';
       document.getElementById('stoStatusText').style.color = d.alert ? 'var(--danger)' : 'var(--success)';
 
-      // Обновление быстрых вопросов ИИ под конкретную поломку
       updateDynamicChips(d);
 
-      // Отрисовка Бортжурнала
       const logBox = document.getElementById('uiLogs');
       logBox.innerHTML = d.logs.map(l => `
         <div class="log-item">
@@ -734,7 +718,6 @@ if __name__ == "__main__":
         </div>
       `).join('');
 
-      // Синхронизация ползунков админки
       document.getElementById('admModel').value = d.model;
       document.getElementById('admError').value = d.error_code;
       document.getElementById('admTemp').value = d.temp;
@@ -813,7 +796,6 @@ if __name__ == "__main__":
       closeAdmin();
     }
 
-    // Отправка сообщений и фото подкапотного пространства в Gemini
     function updatePhotoIndicator() {
       const f = document.getElementById('chatPhoto').files[0];
       if (f) document.getElementById('chatInput').placeholder = `Прикреплено фото: ${f.name}. Добавьте вопрос...`;
@@ -859,7 +841,6 @@ if __name__ == "__main__":
       feed.scrollTop = feed.scrollHeight;
     }
 
-    // Переключение вкладок и Яндекс Карта с маршрутизацией до СТО
     let ymap = null;
     const CAR_COORDS = [55.7558, 37.6173];
 
@@ -897,7 +878,6 @@ if __name__ == "__main__":
       });
     }
 
-    // Вход в скрытую админку (5 кликов, пароль 1488 без подсказок на экране)
     let taps = 0, tapTimer;
     function registerSecretTap() {
       taps++;
