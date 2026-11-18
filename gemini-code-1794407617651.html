@@ -1328,7 +1328,7 @@ if __name__ == "__main__":
           metrics: { rpm: 0, coolant_temp: 0, voltage: 0.0, fuel_level: 0, speed: 0 },
           log: 'Связь с ЭБУ отключена: все показатели сброшены в 0.'
         }));
-      } else id (mode === 'normal') {
+      } else if (mode === 'normal') {
         ws.send(JSON.stringify({
           action: 'telemetry_update',
           is_admin: true,
