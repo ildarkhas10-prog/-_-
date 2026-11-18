@@ -1,24 +1,28 @@
 import os
 import json
+import base64
+import io
 import asyncio
+import urllib.request
+import urllib.error
+import edge_tts
 from datetime import datetime
 from typing import List, Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
-from google.genai import types
 
 app = FastAPI(title="Вектор-Автоваз // Бортовая Экосистема")
 
-# === СТРОКА 15: ВСТАВИТЬ КЛЮЧ API НИЖЕ ===
-GEMINI_API_KEY = "ВСТАВИТЬ_КЛЮЧ_GEMINI_СЮДА"
+# ==============================================================================
+# 🔑 МЕСТО ДЛЯ КЛЮЧЕЙ НА СЕРВЕРЕ (main.py):
+# - Строка 20: Вставьте ваш API-ключ OpenCode Go для ИИ-ядра DeepSeek.
+# ==============================================================================
+OPENCODE_API_KEY = "ВСТАВИТЬ_КЛЮЧ_OPENCODE_GO_СЮДА"
+OPENCODE_BASE_URL = "https://api.opencode.ai/v1/chat/completions"
+AI_MODEL_NAME = "deepseek-v4.1-flash"
 
-MODEL_CASCADE = [
-    "gemini-4-hydrogen",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro"
-]
+HISTORY_DB_FILE = "telemetry_history.jsonl"
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,30 +31,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-# Глобальное состояние: СТРОГО НУЛИ НА СТАРТЕ (данные только от ESP32)
+# Глобальное состояние: СТРОГО НУЛИ НА СТАРТЕ
 vehicle_state: Dict[str, Any] = {
     "car_name": "LADA Vesta NG",
     "engine_type": "gasoline",
     "auto_detect": True,
+    "admin_override": False,  # Если True, ручные данные из админки не перебиваются ESP32
     "status": "ОЖИДАНИЕ ДАННЫХ ЭБУ",
     "dtc_code": "0x00",
-    "lat": 53.51120,  # Тольятти (по умолчанию до получения GPS или сдвига метки)
+    "lat": 53.51120,
     "lon": 49.41850,
     "nearest_sto": "Не определено",
+    "total_packets": 0,
     "metrics": {
         "rpm": 0,
         "coolant_temp": 0,
         "voltage": 0.0,
         "fuel_level": 0,
         "speed": 0,
+        "throttle": 0,
         "est_range": 0
+    },
+    "analysis": {
+        "thermal_state": "Холодный контур / ДВС не запущен",
+        "power_net": "Ожидание замера ЭБУ",
+        "engine_load": "0% (Холостой / Стоянка)",
+        "fuel_rate_lph": 0.0,
+        "wear_index": "Минимальный (0%)",
+        "ai_tips": [
+            "Подключите диагностический модуль ESP32 или запустите ДВС для начала расчёта телеметрии."
+        ]
     },
     "logs": [
         f"[{datetime.now().strftime('%H:%M:%S')}] Бортовой сервер запущен. Ожидание пакетов от ESP32."
     ]
 }
+
+telemetry_archive: List[Dict[str, Any]] = []
+
 
 class ConnectionManager:
     def __init__(self):
@@ -73,17 +91,178 @@ class ConnectionManager:
             except Exception:
                 self.disconnect(connection)
 
+
 manager = ConnectionManager()
+
 
 def add_log(entry: str):
     ts = datetime.now().strftime("%H:%M:%S")
     vehicle_state["logs"].insert(0, f"[{ts}] {entry}")
-    vehicle_state["logs"] = vehicle_state["logs"][:50]
+    vehicle_state["logs"] = vehicle_state["logs"][:100]
+
+
+def save_full_telemetry_record(source: str):
+    record = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "car_name": vehicle_state["car_name"],
+        "status": vehicle_state["status"],
+        "dtc_code": vehicle_state["dtc_code"],
+        "lat": vehicle_state["lat"],
+        "lon": vehicle_state["lon"],
+        "metrics": dict(vehicle_state["metrics"]),
+        "analysis": dict(vehicle_state["analysis"])
+    }
+    telemetry_archive.append(record)
+    if len(telemetry_archive) > 5000:
+        telemetry_archive.pop(0)
+    try:
+        with open(HISTORY_DB_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def compute_deep_analysis():
+    m = vehicle_state["metrics"]
+    rpm = float(m.get("rpm", 0) or 0)
+    temp = float(m.get("coolant_temp", 0) or 0)
+    volt = float(m.get("voltage", 0) or 0)
+    spd = float(m.get("speed", 0) or 0)
+    fuel = float(m.get("fuel_level", 0) or 0)
+    thr = float(m.get("throttle", 0) or 0)
+
+    tips = []
+
+    if temp == 0 and rpm == 0:
+        thermal = "ДВС остановлен (нет потока данных)"
+    elif temp < 50:
+        thermal = f"Прогрев ДВС ({temp:.0f}°C) — повышенная вязкость масла"
+        tips.append("ИИ-Рекомендация: Не превышайте 2500 об/мин до прогрева ОЖ выше 70°C.")
+    elif 50 <= temp <= 98:
+        thermal = f"Оптимальный тепловой баланс ({temp:.0f}°C)"
+    elif 98 < temp < 106:
+        thermal = f"Высокая тепловая нагрузка ({temp:.0f}°C) — ожидание вентилятора СОД"
+        tips.append("ИИ-Рекомендация: Проверьте включение 1-й скорости вентилятора охлаждения.")
+    else:
+        thermal = f"КРИТИЧЕСКИЙ ПЕРЕГРЕВ ({temp:.0f}°C) — риск деформации ГБЦ!"
+        tips.append("ЭКСТРЕННО: Остановите автомобиль, включите отопитель салона на максимум, проверьте термостат и помпу.")
+
+    if volt == 0:
+        p_net = "0.0 В (Цепь разомкнута)"
+    elif rpm == 0:
+        if volt >= 12.4:
+            p_net = f"АКБ в норме ({volt:.1f} В, режим покоя)"
+        elif 11.8 <= volt < 12.4:
+            p_net = f"АКБ частично разряжен ({volt:.1f} В, пассивный режим)"
+            tips.append("ИИ-Рекомендация: Напряжение покоя АКБ снижено, рекомендуется подзарядка или запуск ДВС.")
+        else:
+            p_net = f"Глубокий разряд АКБ ({volt:.1f} В)"
+            tips.append("ВНИМАНИЕ: Риск незапуска стартера. Проверьте ток утечки и клеммы АКБ.")
+    else:
+        if 13.6 <= volt <= 14.6:
+            p_net = f"Генератор исправен ({volt:.1f} В, заряд стабилен)"
+        elif volt < 13.6:
+            p_net = f"Недозаряд генератора ({volt:.1f} В при {rpm:.0f} об/мин)"
+            tips.append("ВНИМАНИЕ: Просадка напряжения при работающем ДВС. Проверьте ремень генератора.")
+        else:
+            p_net = f"Перезаряд бортсети ({volt:.1f} В — пробой РН)"
+            tips.append("КРИТИЧНО: Напряжение выше 14.6 В! Риск выхода из строя электроники.")
+
+    load_pct = min(100, round((rpm / 6000.0) * 65 + (thr * 0.35))) if rpm > 0 else 0
+    if rpm == 0:
+        fuel_lph = 0.0
+    elif spd < 3:
+        fuel_lph = round(0.85 + (rpm / 3500.0), 1)
+    else:
+        fuel_lph = round(1.2 + (rpm / 900.0) + (spd * 0.045), 1)
+
+    wear_score = 0
+    if temp >= 106:
+        wear_score += 55
+    if rpm > 4500:
+        wear_score += 25
+    if 0 < volt < 12.0 and rpm > 500:
+        wear_score += 20
+
+    if spd > 10 and rpm == 0:
+        tips.insert(0, "ИИ-Контроль CAN: Обнаружена скорость при 0 об/мин (отладочный ввод или шум шины).")
+
+    if fuel > 0 and fuel < 15:
+        tips.append("ИИ-Рекомендация: Низкий уровень топлива — избегайте кренов.")
+
+    if not tips:
+        tips.append("Все параметры ЭБУ LADA находятся в эталонном коридоре.")
+
+    vehicle_state["analysis"] = {
+        "thermal_state": thermal,
+        "power_net": p_net,
+        "engine_load": f"{load_pct}% (Дроссель: {thr:.0f}%)",
+        "fuel_rate_lph": fuel_lph,
+        "wear_index": f"{wear_score}% ({'КРИТИЧЕСКИЙ' if wear_score >= 50 else ('ПОВЫШЕННЫЙ' if wear_score >= 25 else 'ШТАТНЫЙ')})",
+        "ai_tips": tips
+    }
+
+
+def apply_telemetry_rules(payload: dict, source: str):
+    incoming = payload.get("metrics", {})
+    for k in ["rpm", "coolant_temp", "voltage", "fuel_level", "speed", "throttle"]:
+        if k in incoming:
+            vehicle_state["metrics"][k] = incoming[k]
+
+    fuel = float(vehicle_state["metrics"].get("fuel_level", 0) or 0)
+    rpm = float(vehicle_state["metrics"].get("rpm", 0) or 0)
+    volt = float(vehicle_state["metrics"].get("voltage", 0) or 0)
+    temp = float(vehicle_state["metrics"].get("coolant_temp", 0) or 0)
+
+    vehicle_state["metrics"]["est_range"] = round(fuel * 5.2) if fuel > 0 else 0
+
+    if "dtc_code" in payload and payload["dtc_code"]:
+        vehicle_state["dtc_code"] = payload["dtc_code"]
+
+    if "status" in payload and payload["status"]:
+        vehicle_state["status"] = payload["status"]
+    else:
+        if rpm == 0 and volt == 0 and temp == 0:
+            vehicle_state["status"] = "ОЖИДАНИЕ ДАННЫХ ЭБУ"
+        elif temp >= 106:
+            vehicle_state["status"] = "КРИТИЧЕСКИЙ ПЕРЕГРЕВ ДВС"
+            vehicle_state["dtc_code"] = "P0217"
+        elif 0 < volt < 11.8 and rpm > 500:
+            vehicle_state["status"] = "ПРОСАДКА БОРТСЕТИ (АКБ)"
+            vehicle_state["dtc_code"] = "P0562"
+        else:
+            vehicle_state["status"] = "СИСТЕМА В НОРМЕ"
+            vehicle_state["dtc_code"] = "Ошибок нет (0x00)"
+
+    if "lat" in payload and "lon" in payload:
+        vehicle_state["lat"] = float(payload["lat"])
+        vehicle_state["lon"] = float(payload["lon"])
+    if "log" in payload and payload["log"]:
+        add_log(payload["log"])
+
+    vehicle_state["total_packets"] += 1
+    compute_deep_analysis()
+    save_full_telemetry_record(source)
+
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
     with open("index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
+
+
+# Эндпоинт генерации качественного живого мужского голоса без роботов
+@app.get("/api/tts")
+async def text_to_speech(text: str):
+    communicate = edge_tts.Communicate(text, voice="ru-RU-DmitryNeural", rate="+5%", pitch="-2Hz")
+    audio_stream = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_stream.write(chunk["data"])
+    audio_stream.seek(0)
+    return StreamingResponse(audio_stream, media_type="audio/mpeg")
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -94,53 +273,30 @@ async def websocket_endpoint(websocket: WebSocket):
             payload = json.loads(raw)
             action = payload.get("action")
 
-            # Прием реальных данных от главной ESP32
             if action == "telemetry_update":
-                incoming = payload.get("metrics", {})
-                for k in ["rpm", "coolant_temp", "voltage", "fuel_level", "speed"]:
-                    if k in incoming:
-                        vehicle_state["metrics"][k] = incoming[k]
+                is_admin_packet = payload.get("is_admin", False)
+                if vehicle_state["admin_override"] and not is_admin_packet:
+                    continue
 
-                # Расчетный параметр по скрипту: запас хода от реального остатка топлива
-                fuel = float(vehicle_state["metrics"].get("fuel_level", 0) or 0)
-                rpm = float(vehicle_state["metrics"].get("rpm", 0) or 0)
-                volt = float(vehicle_state["metrics"].get("voltage", 0) or 0)
-                temp = float(vehicle_state["metrics"].get("coolant_temp", 0) or 0)
+                apply_telemetry_rules(payload, source="ADMIN_PANEL" if is_admin_packet else "ESP32_OBD")
+                await manager.broadcast({"type": "update", "state": vehicle_state})
 
-                vehicle_state["metrics"]["est_range"] = round(fuel * 5.2) if fuel > 0 else 0
-
-                if "dtc_code" in payload:
-                    vehicle_state["dtc_code"] = payload["dtc_code"]
-                if "status" in payload:
-                    vehicle_state["status"] = payload["status"]
-                else:
-                    if rpm == 0 and volt == 0 and temp == 0:
-                        vehicle_state["status"] = "ОЖИДАНИЕ ДАННЫХ ЭБУ"
-                    elif temp >= 106:
-                        vehicle_state["status"] = "КРИТИЧЕСКИЙ ПЕРЕГРЕВ ДВС"
-                        vehicle_state["dtc_code"] = "P0217"
-                    elif 0 < volt < 11.8 and rpm > 500:
-                        vehicle_state["status"] = "ПРОСАДКА БОРТСЕТИ (АКБ)"
-                        vehicle_state["dtc_code"] = "P0562"
-                    else:
-                        vehicle_state["status"] = "СИСТЕМА В НОРМЕ"
-                        vehicle_state["dtc_code"] = "Ошибок нет (0x00)"
-
-                if "car_name" in payload and payload["car_name"]:
-                    vehicle_state["car_name"] = payload["car_name"]
-                if "lat" in payload and "lon" in payload:
-                    vehicle_state["lat"] = float(payload["lat"])
-                    vehicle_state["lon"] = float(payload["lon"])
-                if "log" in payload and payload["log"]:
-                    add_log(payload["log"])
+            elif action == "admin_control":
+                if payload.get("pin") != "1488":
+                    continue
+                if "admin_override" in payload:
+                    vehicle_state["admin_override"] = bool(payload["admin_override"])
+                    state_str = "ВКЛЮЧЕН (приоритет стенда)" if vehicle_state["admin_override"] else "ВЫКЛЮЧЕН (прием от ESP32)"
+                    add_log(f"[АДМИН] Ручной перехват телеметрии: {state_str}")
+                if "car_name" in payload and payload["car_name"].strip():
+                    vehicle_state["car_name"] = payload["car_name"].strip()
+                    add_log(f"[АДМИН] Установлена модель автомобиля: {vehicle_state['car_name']}")
+                if "metrics" in payload:
+                    apply_telemetry_rules(payload, source="ADMIN_MANUAL")
 
                 await manager.broadcast({"type": "update", "state": vehicle_state})
 
-            # Обновление модели LADA или координат с карты/телефона
             elif action == "config_change":
-                if "car_name" in payload and payload["car_name"].strip():
-                    vehicle_state["car_name"] = payload["car_name"].strip()
-                    add_log(f"Выбран автомобиль: {vehicle_state['car_name']}")
                 if "lat" in payload and "lon" in payload:
                     vehicle_state["lat"] = float(payload["lat"])
                     vehicle_state["lon"] = float(payload["lon"])
@@ -149,12 +305,43 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 await manager.broadcast({"type": "update", "state": vehicle_state})
 
-            # Пересылка звуковой команды на ESP32
             elif action == "play_voice":
                 await manager.broadcast(payload)
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+
+def call_opencode_deepseek(system_prompt: str, user_text: str, img_b64: str = None, mime: str = "image/jpeg") -> str:
+    user_content: Any = user_text
+    if img_b64:
+        user_content = [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}}
+        ]
+
+    body = {
+        "model": AI_MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "temperature": 0.35
+    }
+
+    req = urllib.request.Request(
+        OPENCODE_BASE_URL,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENCODE_API_KEY}"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        resp_data = json.loads(resp.read().decode("utf-8"))
+        return resp_data["choices"][0]["message"]["content"]
+
 
 @app.post("/api/ai-diagnose")
 async def ai_diagnose(
@@ -168,89 +355,101 @@ async def ai_diagnose(
     cur_lon = lon if lon else str(vehicle_state["lon"])
     cur_sto = nearest_sto if nearest_sto else vehicle_state.get("nearest_sto", "Не определено")
 
-    # ЖЕСТКАЯ ИНСТРУКЦИЯ ЛИЧНОСТИ VECTOR AI В КАЖДОМ ПРОМПТЕ
     system_prompt = (
-        "ВАЖНАЯ ИНСТРУКЦИЯ: Ты — бортовой интеллектуальный диагност VECTOR AI, созданный Хасяновым Илдаром "
-        "специально для интеллектуальной диагностики автомобилей АО «АВТОВАЗ» (комплекс «Вектор-Автоваз»). "
-        "Никогда и ни при каких условиях не упоминай Gemini, Google или сторонние языковые модели. "
-        "Если спрашивают, кто ты или кто тебя создал — всегда отвечай, что ты VECTOR AI, разработанный Хасяновым Илдаром для АВТОВАЗа.\n\n"
-        f"Текущий автомобиль: {vehicle_state['car_name']}.\n"
-        f"Статус узлов: {vehicle_state['status']}, Код ЭБУ: {vehicle_state['dtc_code']}.\n"
-        f"Реальная телеметрия с датчиков: {json.dumps(vehicle_state['metrics'], ensure_ascii=False)}.\n"
-        f"Точные координаты автомобиля (GPS/Карта): широта {cur_lat}, долгота {cur_lon}.\n"
-        f"Данные карты о ближайшем СТО: {cur_sto}.\n"
-        "Если все показатели телеметрии равны 0 — обязательно укажи, что физический поток данных с ЭБУ сейчас отсутствует (ожидание подключения к OBD-II). "
-        "Если пользователь спрашивает про ближайшее СТО, маршрут или сколько ехать — используй переданные координаты и поиск в интернете/картах, "
-        "назови реальный ближайший автосервис LADA/СТО, его адрес, расстояние и примерное время в пути. "
-        "Отвечай четко, профессионально, используй **жирный шрифт** для акцентов и маркированные списки."
+        "СТРОГАЯ СИСТЕМНАЯ ИНСТРУКЦИЯ:\n"
+        "1. Ты — специализированный бортовой ИИ-диагност VECTOR AI, разработанный исключительно для интеллектуальной "
+        "диагностики, предиктивной аналитики и контроля узлов автомобилей АО «АВТОВАЗ» (комплекс «Вектор-Автоваз»).\n"
+        "2. ВАЖНОЕ ПРАВИЛО О СОЗДАТЕЛЕ: Никогда не упоминай сам по себе своего создателя без прямого вопроса пользователя!\n"
+        "3. КАК ОТВЕЧАТЬ НА ВОПРОСЫ О ТЕБЕ (КТО ТЫ / РАЗРАБОТЧИК): "
+        "На любой вопрос пользователя о тебе, твоем происхождении или разработчике отвечай развернуто и аргументированно, что ты — "
+        "профильный бортовой нейросетевой диагност VECTOR AI, созданный Хасяновым Илдаром лично для автомобилей АО «АВТОВАЗ». "
+        "Аргументируй это тем, что ты интегрирован с шиной CAN (500 кбит/с, протокол ISO 15765-4), анализируешь в реальном времени "
+        "телеметрию ЭБУ LADA и обучен на регламентах АВТОВАЗа. Запрещено упоминать сторонние языковые модели.\n\n"
+        f"ДАННЫЕ БОРТОВОГО КОМПЬЮТЕРА СЕЙЧАС:\n"
+        f"- Автомобиль: {vehicle_state['car_name']}\n"
+        f"- Статус системы: {vehicle_state['status']} | Код DTC: {vehicle_state['dtc_code']}\n"
+        f"- Метрики датчиков: {json.dumps(vehicle_state['metrics'], ensure_ascii=False)}\n"
+        f"- Инженерный анализ: {json.dumps(vehicle_state['analysis'], ensure_ascii=False)}\n"
+        f"- Геопозиция: {cur_lat}, {cur_lon} | Ближайшее СТО: {cur_sto}\n"
+        "Отвечай профессионально, с использованием **жирного шрифта** и списков."
     )
 
-    contents = [f"{system_prompt}\n\nЗапрос пользователя: {prompt}"]
-
+    img_b64 = None
+    mime = "image/jpeg"
     if file:
         img_bytes = await file.read()
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type=file.content_type or "image/jpeg"))
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        mime = file.content_type or "image/jpeg"
 
-    last_error = ""
-    for model_name in MODEL_CASCADE:
-        try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    tools=[{"google_search": {}}]
-                )
+    try:
+        reply_text = await asyncio.to_thread(
+            call_opencode_deepseek,
+            system_prompt,
+            prompt or "Проведи полный анализ текущей телеметрии и узла.",
+            img_b64,
+            mime
+        )
+        return {"status": "ok", "model": AI_MODEL_NAME, "reply": reply_text}
+    except Exception as e:
+        return {
+            "status": "error",
+            "reply": (
+                f"**Ошибка соединения с ядром VECTOR AI ({AI_MODEL_NAME}).**\n"
+                f"Проверьте ключ `OPENCODE_API_KEY` в строке 20 файла `main.py`.\n*Детали: {str(e)}*"
             )
-            return {"status": "ok", "model": "VECTOR-AI-Core", "reply": response.text}
-        except Exception:
-            try:
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=model_name,
-                    contents=contents
-                )
-                return {"status": "ok", "model": "VECTOR-AI-Core", "reply": response.text}
-            except Exception as e2:
-                last_error = str(e2)
-                continue
+        }
 
-    return {
-        "status": "error",
-        "reply": f"**Модуль VECTOR AI временно недоступен.** Повторите запрос.\n*Детали: {last_error}*"
-    }
 
 @app.post("/api/export-md")
 async def export_markdown():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     file_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"vektor_log_{file_ts}.md"
+    filename = f"vektor_full_report_{file_ts}.md"
     filepath = f"/tmp/{filename}"
 
     metrics_lines = "\n".join([f"- **{k}**: `{v}`" for k, v in vehicle_state["metrics"].items()])
+    analysis_lines = "\n".join([f"- **{k}**: `{v}`" for k, v in vehicle_state["analysis"].items() if k != "ai_tips"])
+    tips_lines = "\n".join([f"- {t}" for t in vehicle_state["analysis"].get("ai_tips", [])])
     logs_lines = "\n".join([f"- {l}" for l in vehicle_state["logs"]])
 
-    md_text = f"""# Диагностический отчёт VECTOR AI: {vehicle_state['car_name']}
-*Разработчик системы: Хасянов Илдар // Комплекс «Вектор-Автоваз»*
-*Дата формирования: {now_str}*
+    recent_history = telemetry_archive[-30:]
+    history_lines = "\n".join([
+        f"- `[{r['timestamp']}]` ({r['source']}) RPM: {r['metrics']['rpm']} | T: {r['metrics']['coolant_temp']}°C | "
+        f"V: {r['metrics']['voltage']}В | SPD: {r['metrics']['speed']} км/ч | Статус: {r['status']}"
+        for r in recent_history
+    ]) or "- История пуста"
+
+    md_text = f"""# Полный диагностический отчёт VECTOR AI: {vehicle_state['car_name']}
+*Комплекс «Вектор-Автоваз» // Дата формирования: {now_str}*
+*Всего сохранено пакетов за сессию: {vehicle_state['total_packets']}*
 
 ## 1. Сводка состояния автомобиля
 - **Модель АВТОВАЗ:** `{vehicle_state['car_name']}`
 - **Статус диагностики:** **{vehicle_state['status']}**
 - **Код ЭБУ (DTC):** `{vehicle_state['dtc_code']}`
-- **Координаты автомобиля:** `{vehicle_state['lat']}, {vehicle_state['lon']}`
+- **Координаты:** `{vehicle_state['lat']}, {vehicle_state['lon']}`
 - **Ближайшее СТО:** `{vehicle_state.get('nearest_sto', 'Не выбрано')}`
 
-## 2. Реальные показатели телеметрии (CAN / OBD-II)
+## 2. Текущие показатели телеметрии
 {metrics_lines}
 
-## 3. Бортовой журнал событий
+## 3. Глубокая инженерная аналитика узлов
+{analysis_lines}
+
+### Рекомендации бортового ИИ:
+{tips_lines}
+
+## 4. Архив пакетов (последние 30 из {len(telemetry_archive)})
+{history_lines}
+
+## 5. Бортовой журнал событий
 {logs_lines}
 """
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(md_text)
 
     return {"status": "ok", "download_url": f"/api/download-md/{filename}"}
+
 
 @app.get("/api/download-md/{filename}")
 async def download_markdown(filename: str):
@@ -265,19 +464,21 @@ async def download_markdown(filename: str):
         )
     return PlainTextResponse("Файл не найден", status_code=404)
 
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
-
-                        <!DOCTYPE html>
+            <!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Вектор-Автоваз // VECTOR AI</title>
-  <!-- Подключение Chart.js для графиков истории -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <!-- СТРОКА 9: ВСТАВИТЬ КЛЮЧ ЯНДЕКС КАРТ СРАЗУ ПОСЛЕ apikey= -->
+  <!-- ============================================================================== -->
+  <!-- 🔑 МЕСТО ДЛЯ КЛЮЧА НА КАРТАТ (index.html): -->
+  <!-- - Строка 10: Вставьте ваш API-ключ Яндекс.Карт сразу после apikey= -->
+  <!-- ============================================================================== -->
   <script src="https://api-maps.yandex.ru/2.1/?apikey=ВСТАВИТЬ_КЛЮЧ_ЯНДЕКС_СЮДА&lang=ru_RU" type="text/javascript"></script>
   <style>
     :root {
@@ -295,7 +496,6 @@ if __name__ == "__main__":
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
     body { background: var(--bg); color: var(--text); display: flex; min-height: 100vh; overflow-x: hidden; }
 
-    /* Сайдбар на ПК (слева) и Нижний таб-бар на телефоне */
     .sidebar {
       width: 250px; background: var(--panel); padding: 20px; display: flex; flex-direction: column;
       gap: 10px; border-right: 1px solid rgba(255,255,255,0.12); z-index: 1000;
@@ -318,7 +518,6 @@ if __name__ == "__main__":
       background: rgba(0, 255, 102, 0.1); color: var(--accent); border-color: rgba(0, 255, 102, 0.35); font-weight: 700;
     }
 
-    /* Основная область */
     .main { flex: 1; padding: 20px; display: flex; flex-direction: column; gap: 16px; max-width: 1400px; margin: 0 auto; width: 100%; }
     .header-card {
       background: var(--panel); padding: 16px 20px; border-radius: 14px; display: flex;
@@ -334,7 +533,6 @@ if __name__ == "__main__":
     .badge.warn { background: rgba(255, 208, 0, 0.12); color: var(--warn); border-color: var(--warn); }
     .badge.danger { background: rgba(255, 42, 95, 0.15); color: var(--danger); border-color: var(--danger); }
 
-    /* Панель выбора модели АВТОВАЗ и достоверности */
     .profile-bar {
       background: var(--card); padding: 12px 16px; border-radius: 12px; display: flex;
       flex-wrap: wrap; gap: 10px; align-items: center; border: 1px solid rgba(255,255,255,0.12);
@@ -350,7 +548,16 @@ if __name__ == "__main__":
     .btn:hover { opacity: 0.9; box-shadow: 0 0 10px rgba(0,255,102,0.4); }
     .btn-purple { background: var(--purple); color: #fff; }
 
-    /* Плашка достоверности (Критерий 3) */
+    /* Квадратная зелёная кнопка со скрепкой */
+    .attach-btn {
+      width: 42px; height: 42px; background: var(--accent); color: #000;
+      border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;
+      font-size: 20px; cursor: pointer; transition: 0.2s; flex-shrink: 0; user-select: none;
+      box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+    }
+    .attach-btn:hover { opacity: 0.9; box-shadow: 0 0 14px rgba(0, 255, 102, 0.55); }
+    .attach-btn.has-file { background: #ffd000; box-shadow: 0 0 14px rgba(255, 208, 0, 0.6); }
+
     .validity-strip {
       background: var(--panel); padding: 10px 16px; border-radius: 10px;
       border-left: 4px solid var(--muted); display: flex; justify-content: space-between;
@@ -359,7 +566,24 @@ if __name__ == "__main__":
     .validity-strip.ok { border-left-color: var(--ok); }
     .validity-strip.err { border-left-color: var(--danger); }
 
-    /* Сетка телеметрии с разноцветными неоновыми графиками */
+    .analysis-panel {
+      background: var(--panel); padding: 16px; border-radius: 12px;
+      border: 1px solid rgba(0, 255, 102, 0.25); display: flex; flex-direction: column; gap: 12px;
+    }
+    .analysis-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px;
+    }
+    .analysis-item {
+      background: var(--card); padding: 10px 12px; border-radius: 8px;
+      border-left: 3px solid var(--purple); font-size: 12px;
+    }
+    .analysis-item span { display: block; color: var(--muted); margin-bottom: 4px; }
+    .analysis-item strong { color: #fff; font-size: 13px; }
+    .ai-tips-box {
+      background: rgba(0, 255, 102, 0.07); border: 1px solid rgba(0, 255, 102, 0.25);
+      padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.45;
+    }
+
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
     .metric-card {
       background: var(--panel); padding: 15px; border-radius: 12px;
@@ -370,11 +594,9 @@ if __name__ == "__main__":
     .metric-val { font-size: 25px; font-weight: 800; }
     .chart-box { height: 95px; width: 100%; position: relative; }
 
-    /* Секции вкладок */
     .tab-section { display: none; flex-direction: column; gap: 14px; }
     .tab-section.active { display: flex; }
 
-    /* Чат VECTOR AI */
     .chat-box {
       background: var(--panel); border-radius: 12px; padding: 16px; height: 410px;
       overflow-y: auto; display: flex; flex-direction: column; gap: 12px;
@@ -385,13 +607,12 @@ if __name__ == "__main__":
     .msg.ai { background: var(--card); align-self: flex-start; border-left: 3px solid var(--purple); }
     .msg.ai strong { color: var(--accent); font-weight: 700; }
     .msg.ai ul { margin: 6px 0 6px 20px; }
-    .chat-controls { display: flex; gap: 8px; flex-wrap: wrap; }
+    .chat-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .chat-controls input[type="text"] {
       flex: 1; min-width: 200px; background: var(--panel);
       border: 1px solid rgba(255,255,255,0.22); color: #fff; padding: 11px; border-radius: 8px;
     }
 
-    /* Карта и поиск реального ближайшего СТО */
     .map-toolbar {
       background: var(--panel); padding: 12px 16px; border-radius: 12px;
       border: 1px solid rgba(255,255,255,0.14); display: flex; flex-wrap: wrap;
@@ -402,7 +623,6 @@ if __name__ == "__main__":
       overflow: hidden; border: 1px solid rgba(255,255,255,0.16);
     }
 
-    /* AR-камера */
     #arBox {
       position: relative; width: 100%; max-width: 640px; height: 380px; background: #000;
       border: 2px solid var(--accent); border-radius: 12px; overflow: hidden; margin: 0 auto; display: none;
@@ -414,7 +634,15 @@ if __name__ == "__main__":
       font-family: monospace; font-size: 12px; border-left: 3px solid var(--accent); margin-bottom: 6px;
     }
 
-    /* МОБИЛЬНАЯ АДАПТАЦИЯ: МЕНЮ ПЕРЕКЛЮЧЕНИЯ СТРОГО СНИЗУ ЭКРАНА */
+    .admin-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; width: 100%;
+    }
+    .admin-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+    .admin-field input {
+      background: #000; color: #fff; border: 1px solid rgba(255,208,0,0.4);
+      padding: 8px; border-radius: 6px; font-size: 14px; font-weight: 700;
+    }
+
     @media (max-width: 900px) {
       body { flex-direction: column; padding-bottom: 74px; }
       .brand { display: none; }
@@ -452,40 +680,17 @@ if __name__ == "__main__":
   </aside>
 
   <main class="main">
-    <!-- Шапка статуса авто (клик по заголовку на телефоне тоже открывает пин-код стенда) -->
     <div class="header-card">
       <div onclick="promptAdmin()" style="cursor:pointer;">
         <div class="car-title" id="uiCarName">LADA Vesta NG</div>
         <div class="car-sub" id="uiSubInfo">ЭБУ: CAN 500 kbps (ATSP6) // Код: 0x00</div>
       </div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-        <button class="btn btn-purple" onclick="triggerEspVoice()">🔊 Голос (ESP32)</button>
+        <button class="btn btn-purple" onclick="triggerEspVoice()">🔊 Голос (Диктор)</button>
         <div class="badge warn" id="uiStatusBadge">ОЖИДАНИЕ ДАННЫХ ЭБУ</div>
       </div>
     </div>
 
-    <!-- Выбор автомобиля (полный модельный ряд АВТОВАЗ + ручной ввод) -->
-    <div class="profile-bar">
-      <span style="font-size:12px; color:var(--muted); font-weight:700;">Модель АВТОВАЗ:</span>
-      <select id="ladaPresetSelect" onchange="applyPresetCar(this.value)">
-        <option value="">-- Выбрать из списка LADA --</option>
-        <option value="LADA Vesta NG">LADA Vesta NG</option>
-        <option value="LADA Iskra">LADA Iskra</option>
-        <option value="LADA Niva Travel">LADA Niva Travel</option>
-        <option value="LADA Niva Legend">LADA Niva Legend</option>
-        <option value="LADA Granta FL">LADA Granta FL</option>
-        <option value="LADA Aura">LADA Aura</option>
-        <option value="LADA Largus">LADA Largus</option>
-        <option value="LADA e-Largus (EV)">LADA e-Largus (EV)</option>
-        <option value="LADA XRAY">LADA XRAY</option>
-        <option value="LADA Kalina">LADA Kalina</option>
-        <option value="LADA Priora">LADA Priora</option>
-      </select>
-      <input type="text" id="cfgCarName" placeholder="Или впишите вручную..." />
-      <button class="btn" onclick="saveServerConfig()">Применить</button>
-    </div>
-
-    <!-- Плашка проверки достоверности телеметрии (Критерий 3) -->
     <div class="validity-strip" id="validityStrip">
       <div>
         <strong>Достоверность потока CAN: <span id="validityPercent">0%</span></strong>
@@ -494,28 +699,54 @@ if __name__ == "__main__":
       <span id="aiQuickForecast" style="color:var(--accent); font-weight:700;">Прогноз: ожидание телеметрии</span>
     </div>
 
-    <!-- Вкладка 1: Телеметрия и Разноцветные Неоновые Графики -->
     <section id="tab-telemetry" class="tab-section active">
       <div class="grid" id="metricsGrid"></div>
+
+      <div class="analysis-panel">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <strong style="color:var(--accent); font-size:15px;">🧠 Бортовой аналитический модуль VECTOR AI (Реальное время)</strong>
+          <span style="font-size:12px; color:var(--muted);">Сохранено пакетов в БД: <strong id="uiTotalPackets" style="color:#fff;">0</strong></span>
+        </div>
+        <div class="analysis-grid">
+          <div class="analysis-item">
+            <span>Термодинамика СОД</span>
+            <strong id="anThermal">Ожидание данных</strong>
+          </div>
+          <div class="analysis-item">
+            <span>КПД бортсети и АКБ</span>
+            <strong id="anPower">Ожидание данных</strong>
+          </div>
+          <div class="analysis-item">
+            <span>Расчётная нагрузка ДВС</span>
+            <strong id="anLoad">0%</strong>
+          </div>
+          <div class="analysis-item">
+            <span>Мгновенный расход / Износ</span>
+            <strong id="anFuelWear">0.0 л/ч | 0%</strong>
+          </div>
+        </div>
+        <div class="ai-tips-box" id="anAiTips">
+          <strong>Оперативные подсказки ИИ:</strong> Подключите диагностический модуль ESP32 или запустите ДВС для начала расчёта телеметрии.
+        </div>
+      </div>
     </section>
 
-    <!-- Вкладка 2: ИИ-Диагност (VECTOR AI — Хасянов Илдар) -->
     <section id="tab-ai" class="tab-section">
       <div class="chat-box" id="chatBox">
         <div class="msg ai">
-          Здравствуйте! Я — бортовая нейросеть <strong>VECTOR AI</strong>, созданная <strong>Хасяновым Илдаром</strong> для интеллектуальной диагностики автомобилей <strong>АО «АВТОВАЗ»</strong>.<br>
-          Я вижу текущую телеметрию ЭБУ и вашу геолокацию на карте. Спросите меня о состоянии узлов или нажмите кнопку ниже, чтобы узнать, где ближайшее СТО и сколько до него ехать.
+          Здравствуйте! Я — бортовая нейросеть-диагност <strong>VECTOR AI</strong> для автомобилей <strong>АО «АВТОВАЗ»</strong>.<br>
+          Я непрерывно анализирую поток телеметрии с шины CAN, коды ЭБУ и вашу геопозицию. Задайте вопрос по состоянию узлов, прикрепите фото подкапотного пространства или запросите маршрут до ближайшего СТО.
         </div>
       </div>
       <div class="chat-controls">
-        <input type="text" id="aiPrompt" placeholder="Спросите VECTOR AI о поломке или ближайшем СТО..." onkeydown="if(event.key==='Enter') sendAiRequest()" />
-        <input type="file" id="aiFile" accept="image/*" style="max-width:190px; font-size:12px; color:var(--muted);" />
+        <input type="text" id="aiPrompt" placeholder="Спросите VECTOR AI о поломке, диагностике или ближайшем СТО..." onkeydown="if(event.key==='Enter') sendAiRequest()" />
+        <input type="file" id="aiFile" accept="image/*" style="display:none;" onchange="updateFileBtnState(this)" />
+        <label for="aiFile" class="attach-btn" id="attachBtnLabel" title="Прикрепить фото">📎</label>
         <button class="btn" onclick="sendAiRequest()">Спросить VECTOR AI</button>
         <button class="btn btn-purple" onclick="askAiNearestSto()">📍 Спросить ИИ про СТО и время</button>
       </div>
     </section>
 
-    <!-- Вкладка 3: Карта (Реальный GPS + Перетаскивание на ПК + Поиск реального ближайшего СТО) -->
     <section id="tab-map" class="tab-section">
       <div class="map-toolbar">
         <div>
@@ -530,7 +761,6 @@ if __name__ == "__main__":
       <div id="yandex-map"></div>
     </section>
 
-    <!-- Вкладка 4: Лёгкий AR-Осмотр (Критерий 9) -->
     <section id="tab-ar" class="tab-section">
       <div class="map-toolbar">
         <div>
@@ -553,24 +783,83 @@ if __name__ == "__main__":
       </div>
     </section>
 
-    <!-- Вкладка 5: Бортжурнал -->
     <section id="tab-logs" class="tab-section">
       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-        <h3>Бортовой журнал и отчёты</h3>
+        <h3>Бортовой журнал и полные отчёты</h3>
         <div style="display:flex; gap:8px;">
-          <button class="btn" onclick="exportMarkdown()">📥 Скачать отчёт (.md)</button>
+          <button class="btn" onclick="exportMarkdown()">📥 Скачать полный отчёт и БД (.md)</button>
           <button class="btn btn-purple" onclick="window.print()">📄 Печать / PDF</button>
         </div>
       </div>
       <div id="logsContainer"></div>
     </section>
 
-    <!-- Вкладка 6: Скрытый инженерный стенд (1488) -->
     <section id="tab-admin" class="tab-section">
+      <div class="profile-bar" style="border-color:#ffd000;">
+        <span style="font-size:13px; color:#ffd000; font-weight:800;">🔒 Модель АВТОВАЗ (Только Админ):</span>
+        <select id="ladaPresetSelect" onchange="applyPresetCar(this.value)">
+          <option value="">-- Выбрать из списка LADA --</option>
+          <option value="LADA Vesta NG">LADA Vesta NG</option>
+          <option value="LADA Iskra">LADA Iskra</option>
+          <option value="LADA Niva Travel">LADA Niva Travel</option>
+          <option value="LADA Niva Legend">LADA Niva Legend</option>
+          <option value="LADA Granta FL">LADA Granta FL</option>
+          <option value="LADA Aura">LADA Aura</option>
+          <option value="LADA Largus">LADA Largus</option>
+          <option value="LADA e-Largus (EV)">LADA e-Largus (EV)</option>
+          <option value="LADA XRAY">LADA XRAY</option>
+          <option value="LADA Kalina">LADA Kalina</option>
+          <option value="LADA Priora">LADA Priora</option>
+        </select>
+        <input type="text" id="cfgCarName" placeholder="Или впишите марку вручную..." />
+        <button class="btn" onclick="saveServerConfig()">Установить модель</button>
+      </div>
+
+      <div class="map-toolbar" style="border-color:#ffd000; flex-direction:column; align-items:flex-start;">
+        <div style="display:flex; justify-content:space-between; width:100%; align-items:center; flex-wrap:wrap; gap:10px;">
+          <div>
+            <h3 style="color:#ffd000;">Ручное управление телеметрией (Приоритет Админа)</h3>
+            <p style="font-size:12px; color:var(--muted);">Позволяет вручную задать любые значения датчиков даже при подключенной по Wi-Fi плате ESP32.</p>
+          </div>
+          <label style="display:flex; align-items:center; gap:8px; font-size:13px; font-weight:800; color:#ffd000; cursor:pointer;">
+            <input type="checkbox" id="admOverrideChk" onchange="toggleAdminOverride(this.checked)" style="width:18px; height:18px;" />
+            Блокировать перезапись от OBD (Перехват)
+          </label>
+        </div>
+
+        <div class="admin-grid">
+          <div class="admin-field">
+            <label>Обороты (об/мин)</label>
+            <input type="number" id="admRpm" value="850" />
+          </div>
+          <div class="admin-field">
+            <label>Температура ОЖ (°C)</label>
+            <input type="number" id="admTemp" value="90" />
+          </div>
+          <div class="admin-field">
+            <label>Скорость (км/ч)</label>
+            <input type="number" id="admSpeed" value="0" />
+          </div>
+          <div class="admin-field">
+            <label>Напряжение АКБ (В)</label>
+            <input type="number" step="0.1" id="admVolt" value="14.1" />
+          </div>
+          <div class="admin-field">
+            <label>Уровень топлива (%)</label>
+            <input type="number" id="admFuel" value="70" />
+          </div>
+          <div class="admin-field">
+            <label>Дроссель (%)</label>
+            <input type="number" id="admThrottle" value="12" />
+          </div>
+        </div>
+        <button class="btn" style="background:#ffd000; color:#000;" onclick="sendManualAdminMetrics()">⚡ Отправить ручные данные на сервер</button>
+      </div>
+
       <div class="map-toolbar" style="border-color:#ffd000;">
         <div>
-          <h3 style="color:#ffd000;">Инженерный стенд проверки (1488)</h3>
-          <p style="font-size:12px; color:var(--muted);">Позволяет протестировать нулевое состояние, штатный поток ESP32 и защиту от противоречивых данных.</p>
+          <h3 style="color:#ffd000;">Быстрые сценарии стенда (1488)</h3>
+          <p style="font-size:12px; color:var(--muted);">Мгновенная проверка нулевого состояния, нормы, перегрева и защиты от противоречивых данных.</p>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn" style="background:#555; color:#fff;" onclick="simulatePreset('zero')">0️⃣ Сброс в НУЛИ (Нет ЭБУ)</button>
@@ -583,14 +872,13 @@ if __name__ == "__main__":
   </main>
 
   <script>
-    // ТОЛЬКО РЕАЛЬНЫЕ ПАРАМЕТРЫ ОТ ТВОЕЙ ESP32 + 1 РАСЧЕТНЫЙ (КАЖДЫЙ СО СВОИМ НЕОНОВЫМ ЦВЕТОМ БЕЗ ПОВТОРОВ)
     const REAL_LADA_METRICS = [
-      { key: 'rpm',          label: 'Обороты двигателя (010C)', unit: 'об/мин', color: '#b829ff', bg: 'rgba(184, 41, 255, 0.14)' }, // Неоновый фиолетовый
-      { key: 'coolant_temp', label: 'Температура ОЖ (0105)',    unit: '°C',     color: '#ff2a5f', bg: 'rgba(255, 42, 95, 0.14)'  }, // Неоновый красный
-      { key: 'speed',        label: 'Скорость авто (010D)',     unit: 'км/ч',   color: '#00e5ff', bg: 'rgba(0, 229, 255, 0.14)'  }, // Неоновый синий
-      { key: 'voltage',      label: 'Напряжение сети (ATRV)',   unit: 'В',      color: '#ffd000', bg: 'rgba(255, 208, 0, 0.14)'  }, // Неоновый желтый
-      { key: 'fuel_level',   label: 'Уровень топлива (012F)',   unit: '%',      color: '#ff6b00', bg: 'rgba(255, 107, 0, 0.14)'  }, // Неоновый оранжевый
-      { key: 'est_range',    label: 'Расчётный запас хода',     unit: 'км',     color: '#00ff66', bg: 'rgba(0, 255, 102, 0.14)'  }  // Неоновый зеленый
+      { key: 'rpm',          label: 'Обороты двигателя (010C)', unit: 'об/мин', color: '#b829ff', bg: 'rgba(184, 41, 255, 0.14)' },
+      { key: 'coolant_temp', label: 'Температура ОЖ (0105)',    unit: '°C',     color: '#ff2a5f', bg: 'rgba(255, 42, 95, 0.14)'  },
+      { key: 'speed',        label: 'Скорость авто (010D)',     unit: 'км/ч',   color: '#00e5ff', bg: 'rgba(0, 229, 255, 0.14)'  },
+      { key: 'voltage',      label: 'Напряжение сети (ATRV)',   unit: 'В',      color: '#ffd000', bg: 'rgba(255, 208, 0, 0.14)'  },
+      { key: 'fuel_level',   label: 'Уровень топлива (012F)',   unit: '%',      color: '#ff6b00', bg: 'rgba(255, 107, 0, 0.14)'  },
+      { key: 'est_range',    label: 'Расчётный запас хода',     unit: 'км',     color: '#00ff66', bg: 'rgba(0, 255, 102, 0.14)'  }
     ];
 
     let ws;
@@ -599,12 +887,24 @@ if __name__ == "__main__":
     const historyData = {};
     let yMap = null;
     let carPlacemark = null;
-    let stoSearchControl = null;
     let activeRoute = null;
-    let lastDataTimestamp = 0;
     let arStream = null;
+    let isAdminUnlocked = false;
+    let currentAudio = null;
 
-    // 1. Чистый парсер Markdown
+    function updateFileBtnState(input) {
+      const lbl = document.getElementById('attachBtnLabel');
+      if (input.files && input.files.length > 0) {
+        lbl.classList.add('has-file');
+        lbl.textContent = '✅';
+        lbl.title = 'Выбран файл: ' + input.files[0].name;
+      } else {
+        lbl.classList.remove('has-file');
+        lbl.textContent = '📎';
+        lbl.title = 'Прикрепить фото';
+      }
+    }
+
     function renderMarkdown(mdText) {
       if (!mdText) return "";
       let html = mdText
@@ -618,7 +918,6 @@ if __name__ == "__main__":
       return html.replace(/\n/g, "<br>");
     }
 
-    // 2. Построение сетки с разноцветными неоновыми графиками (строго 0 на старте)
     function buildMetricsGrid() {
       const grid = document.getElementById('metricsGrid');
       grid.innerHTML = '';
@@ -669,7 +968,6 @@ if __name__ == "__main__":
       });
     }
 
-    // 3. Проверка достоверности входных данных (Критерий 3 положения)
     function evaluateValidity(m) {
       const rpm = Number(m.rpm) || 0;
       const spd = Number(m.speed) || 0;
@@ -695,10 +993,8 @@ if __name__ == "__main__":
       };
     }
 
-    // 4. Обновление UI
     function updateUI(state) {
       currentState = state;
-      lastDataTimestamp = Date.now();
 
       document.getElementById('uiCarName').innerText = state.car_name;
       document.getElementById('uiSubInfo').innerText = `АВТОВАЗ CAN (ATSP6) // Код ЭБУ: ${state.dtc_code}`;
@@ -706,6 +1002,8 @@ if __name__ == "__main__":
       if (document.activeElement !== document.getElementById('cfgCarName')) {
         document.getElementById('cfgCarName').value = state.car_name;
       }
+      document.getElementById('admOverrideChk').checked = Boolean(state.admin_override);
+      document.getElementById('uiTotalPackets').innerText = state.total_packets || 0;
 
       const vCheck = evaluateValidity(state.metrics);
       const strip = document.getElementById('validityStrip');
@@ -739,17 +1037,24 @@ if __name__ == "__main__":
         }
       });
 
-      // Обновление AR-подсказок
+      if (state.analysis) {
+        document.getElementById('anThermal').innerText = state.analysis.thermal_state || '—';
+        document.getElementById('anPower').innerText = state.analysis.power_net || '—';
+        document.getElementById('anLoad').innerText = state.analysis.engine_load || '0%';
+        document.getElementById('anFuelWear').innerText = `${state.analysis.fuel_rate_lph || 0} л/ч | Износ: ${state.analysis.wear_index || '0%'}`;
+        const tipsArr = state.analysis.ai_tips || [];
+        document.getElementById('anAiTips').innerHTML =
+          `<strong>Оперативные подсказки ИИ:</strong><br>` + tipsArr.map(t => `• ${t}`).join('<br>');
+      }
+
       document.getElementById('arVoltText').textContent = (Number(state.metrics.voltage) || 0).toFixed(1) + " В";
       document.getElementById('arEngineText').textContent = `${state.metrics.rpm || 0} об/м | ${state.metrics.coolant_temp || 0} °C`;
       document.getElementById('arEngineRect').setAttribute('stroke', (state.metrics.coolant_temp >= 106) ? '#ff2a5f' : '#00ff66');
 
-      // Журнал
       const logsBox = document.getElementById('logsContainer');
       logsBox.innerHTML = (state.logs || []).map(l => `<div class="log-item">${l}</div>`).join('');
     }
 
-    // 5. WebSocket + сброс в 0 при обрыве связи с сервером
     function connectWS() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -767,34 +1072,60 @@ if __name__ == "__main__":
       };
     }
 
-    // Выбор машины из списка АВТОВАЗа или вручную
     function applyPresetCar(val) {
-      if (!val) return;
+      if (!val || !isAdminUnlocked) return;
       document.getElementById('cfgCarName').value = val;
       saveServerConfig();
     }
 
     function saveServerConfig() {
-      if (!ws || ws.readyState !== 1) return;
+      if (!ws || ws.readyState !== 1 || !isAdminUnlocked) return;
       const name = document.getElementById('cfgCarName').value.trim() || "LADA Vesta NG";
-      ws.send(JSON.stringify({ action: 'config_change', car_name: name }));
+      ws.send(JSON.stringify({ action: 'admin_control', pin: '1488', car_name: name }));
     }
 
+    function toggleAdminOverride(checked) {
+      if (!ws || ws.readyState !== 1 || !isAdminUnlocked) return;
+      ws.send(JSON.stringify({ action: 'admin_control', pin: '1488', admin_override: checked }));
+    }
+
+    function sendManualAdminMetrics() {
+      if (!ws || ws.readyState !== 1 || !isAdminUnlocked) return;
+      document.getElementById('admOverrideChk').checked = true;
+      ws.send(JSON.stringify({
+        action: 'admin_control',
+        pin: '1488',
+        admin_override: true,
+        metrics: {
+          rpm: Number(document.getElementById('admRpm').value) || 0,
+          coolant_temp: Number(document.getElementById('admTemp').value) || 0,
+          speed: Number(document.getElementById('admSpeed').value) || 0,
+          voltage: Number(document.getElementById('admVolt').value) || 0,
+          fuel_level: Number(document.getElementById('admFuel').value) || 0,
+          throttle: Number(document.getElementById('admThrottle').value) || 0
+        },
+        log: '[АДМИН] Ручной ввод показателей телеметрии со стенда.'
+      }));
+    }
+
+    // Воспроизведение качественного мужского живого голоса через серверный edge-tts
     function triggerEspVoice() {
       if (ws && ws.readyState === 1) {
         const track = (currentState && currentState.metrics.coolant_temp >= 106) ? 2 : 1;
         ws.send(JSON.stringify({ action: 'play_voice', track: track }));
       }
-      if ('speechSynthesis' in window) {
-        const msg = (currentState && currentState.metrics.rpm > 0)
-          ? `Система Вектор Автоваз. Автомобиль ${currentState.car_name}. Статус: ${currentState.status}. Обороты ${currentState.metrics.rpm}, температура ${currentState.metrics.coolant_temp} градусов.`
-          : `Система Вектор Автоваз. Данные с ЭБУ не поступают, все датчики по нулям.`;
-        window.speechSynthesis.cancel();
-        window.speechSynthesis.speak(new SpeechSynthesisUtterance(msg));
+
+      const msg = (currentState && (currentState.metrics.rpm > 0 || currentState.metrics.voltage > 0))
+        ? `Система Вектор Автоваз. Автомобиль ${currentState.car_name}. Статус: ${currentState.status}. Обороты ${currentState.metrics.rpm}, температура ${currentState.metrics.coolant_temp} градусов, бортсеть ${currentState.metrics.voltage} вольт.`
+        : `Система Вектор Автоваз. Данные с ЭБУ не поступают, ожидание запуска.`;
+
+      if (currentAudio) {
+        currentAudio.pause();
       }
+      currentAudio = new Audio(`/api/tts?text=${encodeURIComponent(msg)}`);
+      currentAudio.play();
     }
 
-    // 6. Запрос к VECTOR AI (с передачей точных координат и ближайшего СТО)
     async function sendAiRequest(customPrompt) {
       const input = document.getElementById('aiPrompt');
       const fileInput = document.getElementById('aiFile');
@@ -814,6 +1145,7 @@ if __name__ == "__main__":
       if (fileInput.files.length) {
         formData.append('file', fileInput.files[0]);
         fileInput.value = '';
+        updateFileBtnState(fileInput);
       }
 
       const tempId = 'ai_' + Date.now();
@@ -834,7 +1166,6 @@ if __name__ == "__main__":
       sendAiRequest("Где находится ближайшее ко мне СТО по моим текущим координатам, какое расстояние и сколько времени туда ехать?");
     }
 
-    // 7. Карта Яндекс: Реальный GPS + Перетаскиваемая метка на ПК + Поиск реального ближайшего СТО
     function initYandexMap() {
       if (typeof ymaps === 'undefined') {
         document.getElementById('yandex-map').innerHTML =
@@ -849,7 +1180,6 @@ if __name__ == "__main__":
           controls: ['zoomControl', 'fullscreenControl']
         });
 
-        // Метка автомобиля с поддержкой перетаскивания мышкой на ПК (draggable: true)
         carPlacemark = new ymaps.Placemark(
           startCoords,
           { balloonContent: 'Ваш автомобиль LADA (перетащите метку для смены позиции)' },
@@ -857,20 +1187,17 @@ if __name__ == "__main__":
         );
         yMap.geoObjects.add(carPlacemark);
 
-        // Когда пользователь перетащил метку мышкой
         carPlacemark.events.add('dragend', function () {
           const newCoords = carPlacemark.geometry.getCoordinates();
           updateCarCoordinates(newCoords[0], newCoords[1], "Точка задана вручную на карте");
         });
 
-        // Клик по карте тоже переставляет метку машины
         yMap.events.add('click', function (e) {
           const coords = e.get('coords');
           carPlacemark.geometry.setCoordinates(coords);
           updateCarCoordinates(coords[0], coords[1], "Точка выбрана кликом по карте");
         });
 
-        // Автоматическая попытка получить реальный GPS при открытии
         locateRealGPS();
       });
     }
@@ -911,7 +1238,6 @@ if __name__ == "__main__":
       );
     }
 
-    // Поиск реального ближайшего СТО через Яндекс и построение маршрута
     function findAndRouteNearestSTO() {
       if (!yMap || !carPlacemark) return;
       const myCoords = carPlacemark.geometry.getCoordinates();
@@ -951,7 +1277,6 @@ if __name__ == "__main__":
       });
     }
 
-    // 8. AR Камера
     async function toggleAR() {
       const box = document.getElementById('arBox');
       const video = document.getElementById('arVideo');
@@ -969,14 +1294,12 @@ if __name__ == "__main__":
       }
     }
 
-    // 9. Экспорт в .md
     async function exportMarkdown() {
       const res = await fetch('/api/export-md', { method: 'POST' });
       const data = await res.json();
       if (data.download_url) window.location.href = data.download_url;
     }
 
-    // 10. Вкладки и скрытый стенд (1488)
     function switchTab(tabId, btn) {
       document.querySelectorAll('.tab-section').forEach(s => s.classList.remove('active'));
       document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
@@ -988,6 +1311,7 @@ if __name__ == "__main__":
     function promptAdmin() {
       const pin = prompt('Введите инженерный код доступа:');
       if (pin === '1488') {
+        isAdminUnlocked = true;
         document.getElementById('adminNavBtn').style.display = 'flex';
         switchTab('admin', document.getElementById('adminNavBtn'));
       }
@@ -998,14 +1322,16 @@ if __name__ == "__main__":
       if (mode === 'zero') {
         ws.send(JSON.stringify({
           action: 'telemetry_update',
+          is_admin: true,
           status: 'ОЖИДАНИЕ ДАННЫХ ЭБУ',
           dtc_code: '0x00',
           metrics: { rpm: 0, coolant_temp: 0, voltage: 0.0, fuel_level: 0, speed: 0 },
           log: 'Связь с ЭБУ отключена: все показатели сброшены в 0.'
         }));
-      } else if (mode === 'normal') {
+      } else id (mode === 'normal') {
         ws.send(JSON.stringify({
           action: 'telemetry_update',
+          is_admin: true,
           status: 'СИСТЕМА В НОРМЕ',
           dtc_code: 'Ошибок нет (0x00)',
           metrics: { rpm: 840, coolant_temp: 89, voltage: 14.2, fuel_level: 65, speed: 45 },
@@ -1014,6 +1340,7 @@ if __name__ == "__main__":
       } else if (mode === 'overheat') {
         ws.send(JSON.stringify({
           action: 'telemetry_update',
+          is_admin: true,
           status: 'КРИТИЧЕСКИЙ ПЕРЕГРЕВ ДВС',
           dtc_code: 'P0217 (Высокая Т° ОЖ)',
           metrics: { rpm: 3100, coolant_temp: 115, voltage: 13.6, fuel_level: 62, speed: 30 },
@@ -1022,6 +1349,7 @@ if __name__ == "__main__":
       } else if (mode === 'anomaly') {
         ws.send(JSON.stringify({
           action: 'telemetry_update',
+          is_admin: true,
           status: 'ПРОТИВОРЕЧИЕ ДАННЫХ',
           dtc_code: 'ERR_CAN_SYNC',
           metrics: { rpm: 0, coolant_temp: 88, voltage: 14.1, fuel_level: 60, speed: 65 },
