@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import time
 import base64
 import io
 import asyncio
@@ -15,11 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Вектор-Автоваз // Бортовая Экосистема")
 
 # ==============================================================================
-# 🔑 МЕСТО ДЛЯ КЛЮЧЕЙ НА СЕРВЕРЕ (main.py):
-# - Строка 20: Вставьте ваш API-ключ OpenCode Go для ИИ-ядра DeepSeek.
+# 🔑 СТРОКА 22: ВСТАВИТЬ КЛЮЧ OPENCODE GO НИЖЕ
 # ==============================================================================
 OPENCODE_API_KEY = "ВСТАВИТЬ_КЛЮЧ_OPENCODE_GO_СЮДА"
-OPENCODE_BASE_URL = "https://api.opencode.ai/v1/chat/completions"
+OPENCODE_BASE_URL = "https://opencode.ai/inference/go/openai/v1/chat/completions"
 AI_MODEL_NAME = "deepseek-v4.1-flash"
 
 HISTORY_DB_FILE = "telemetry_history.jsonl"
@@ -31,14 +32,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Глобальное состояние: СТРОГО НУЛИ НА СТАРТЕ
 vehicle_state: Dict[str, Any] = {
     "car_name": "LADA Vesta NG",
     "engine_type": "gasoline",
     "auto_detect": True,
-    "admin_override": False,  # Если True, ручные данные из админки не перебиваются ESP32
+    "admin_override": False,
     "status": "ОЖИДАНИЕ ДАННЫХ ЭБУ",
     "dtc_code": "0x00",
+    "issue_text": "Ожидание OBD-II",
     "lat": 53.51120,
     "lon": 49.41850,
     "nearest_sto": "Не определено",
@@ -68,6 +69,8 @@ vehicle_state: Dict[str, Any] = {
 }
 
 telemetry_archive: List[Dict[str, Any]] = []
+last_alert_issue = ""
+last_alert_ts = 0.0
 
 
 class ConnectionManager:
@@ -108,6 +111,7 @@ def save_full_telemetry_record(source: str):
         "car_name": vehicle_state["car_name"],
         "status": vehicle_state["status"],
         "dtc_code": vehicle_state["dtc_code"],
+        "issue_text": vehicle_state.get("issue_text", ""),
         "lat": vehicle_state["lat"],
         "lon": vehicle_state["lon"],
         "metrics": dict(vehicle_state["metrics"]),
@@ -155,10 +159,10 @@ def compute_deep_analysis():
             p_net = f"АКБ в норме ({volt:.1f} В, режим покоя)"
         elif 11.8 <= volt < 12.4:
             p_net = f"АКБ частично разряжен ({volt:.1f} В, пассивный режим)"
-            tips.append("ИИ-Рекомендация: Напряжение покоя АКБ снижено, рекомендуется подзарядка или запуск ДВС.")
+            tips.append("ИИ-Рекомендация: Напряжение покоя АКБ снижено, рекомендуется подзарядка.")
         else:
             p_net = f"Глубокий разряд АКБ ({volt:.1f} В)"
-            tips.append("ВНИМАНИЕ: Риск незапуска стартера. Проверьте ток утечки и клеммы АКБ.")
+            tips.append("ВНИМАНИЕ: Риск незапуска стартера. Проверьте клеммы АКБ.")
     else:
         if 13.6 <= volt <= 14.6:
             p_net = f"Генератор исправен ({volt:.1f} В, заряд стабилен)"
@@ -188,8 +192,8 @@ def compute_deep_analysis():
     if spd > 10 and rpm == 0:
         tips.insert(0, "ИИ-Контроль CAN: Обнаружена скорость при 0 об/мин (отладочный ввод или шум шины).")
 
-    if fuel > 0 and fuel < 15:
-        tips.append("ИИ-Рекомендация: Низкий уровень топлива — избегайте кренов.")
+    if 0 < fuel < 15:
+        tips.append("ИИ-Рекомендация: Низкий уровень топлива — запланируйте заправку.")
 
     if not tips:
         tips.append("Все параметры ЭБУ LADA находятся в эталонном коридоре.")
@@ -204,7 +208,100 @@ def compute_deep_analysis():
     }
 
 
+def detect_significant_issue(payload: dict) -> str:
+    """Определяет значительное отклонение для авто-вызова ИИ."""
+    issue = str(payload.get("issue_text", "") or "").strip()
+    if issue and issue not in ["Все в норме", "Ожидание OBD-II", "Подключение к сети", "Подключение к серверу"]:
+        return issue
+
+    m = vehicle_state["metrics"]
+    rpm = float(m.get("rpm", 0) or 0)
+    temp = float(m.get("coolant_temp", 0) or 0)
+    volt = float(m.get("voltage", 0) or 0)
+    fuel = float(m.get("fuel_level", 0) or 0)
+    spd = float(m.get("speed", 0) or 0)
+
+    if temp >= 106:
+        return f"Перегрев ДВС ({temp:.0f}°C)"
+    if rpm >= 5500:
+        return f"Критические обороты ({rpm:.0f} об/мин)"
+    if 0 < volt < 11.8 and rpm > 0:
+        return f"Просадка бортсети ({volt:.1f} В)"
+    if volt > 14.8:
+        return f"Перезаряд АКБ ({volt:.1f} В)"
+    if temp >= 99:
+        return f"Повышенная температура ({temp:.0f}°C)"
+    if rpm >= 4000:
+        return f"Повышенные обороты ({rpm:.0f} об/мин)"
+    if 0 < fuel <= 15:
+        return f"Мало бензина ({fuel:.0f}%)"
+    if spd > 10 and rpm == 0:
+        return "Сбой датчика скорости"
+    return ""
+
+
+def call_opencode_deepseek(system_prompt: str, user_text: str, img_b64: str = None, mime: str = "image/jpeg") -> str:
+    user_content: Any = user_text
+    if img_b64:
+        user_content = [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}}
+        ]
+
+    body = {
+        "model": AI_MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "temperature": 0.35
+    }
+
+    req = urllib.request.Request(
+        OPENCODE_BASE_URL,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENCODE_API_KEY}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "x-opencode-session": "vector-avtovaz-main-session"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        resp_data = json.loads(resp.read().decode("utf-8"))
+        return resp_data["choices"][0]["message"]["content"]
+
+
+async def trigger_auto_ai_alert(issue_title: str):
+    """Автоматически запрашивает краткий совет у ИИ и рассылает озвучку на все устройства."""
+    sys_prompt = (
+        "Ты — бортовой голосовой ИИ-диагност VECTOR AI для автомобилей АВТОВАЗ. "
+        "Отвечай МАКСИМАЛЬНО КРАТКО (строго 1-2 коротких предложения, без списков и звёздочек, "
+        "как голосовой помощник в машине): назови, что произошло, и дай один чёткий совет водителю."
+    )
+    user_prompt = (
+        f"Зафиксировано отклонение: {issue_title}. "
+        f"Текущие данные: {json.dumps(vehicle_state['metrics'], ensure_ascii=False)}. "
+        "Кратко объясни проблему и что сделать прямо сейчас."
+    )
+    try:
+        reply_text = await asyncio.to_thread(call_opencode_deepseek, sys_prompt, user_prompt)
+    except Exception:
+        reply_text = f"Внимание: {issue_title}. Проверьте показатели на приборной панели."
+
+    add_log(f"[VECTOR AI АВТО] {reply_text}")
+    await manager.broadcast({
+        "type": "ai_broadcast",
+        "from_chat": False,
+        "title": issue_title,
+        "text": reply_text
+    })
+
+
 def apply_telemetry_rules(payload: dict, source: str):
+    global last_alert_issue, last_alert_ts
+
     incoming = payload.get("metrics", {})
     for k in ["rpm", "coolant_temp", "voltage", "fuel_level", "speed", "throttle"]:
         if k in incoming:
@@ -216,6 +313,9 @@ def apply_telemetry_rules(payload: dict, source: str):
     temp = float(vehicle_state["metrics"].get("coolant_temp", 0) or 0)
 
     vehicle_state["metrics"]["est_range"] = round(fuel * 5.2) if fuel > 0 else 0
+
+    if "issue_text" in payload and payload["issue_text"]:
+        vehicle_state["issue_text"] = payload["issue_text"]
 
     if "dtc_code" in payload and payload["dtc_code"]:
         vehicle_state["dtc_code"] = payload["dtc_code"]
@@ -245,6 +345,17 @@ def apply_telemetry_rules(payload: dict, source: str):
     compute_deep_analysis()
     save_full_telemetry_record(source)
 
+    # Проверка значительного изменения для авто-ответа ИИ
+    issue_now = detect_significant_issue(payload)
+    now_ts = time.time()
+    if issue_now:
+        if issue_now != last_alert_issue or (now_ts - last_alert_ts > 25):
+            last_alert_issue = issue_now
+            last_alert_ts = now_ts
+            asyncio.create_task(trigger_auto_ai_alert(issue_now))
+    else:
+        last_alert_issue = ""
+
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
@@ -252,10 +363,10 @@ async def get_index():
         return HTMLResponse(content=f.read())
 
 
-# Эндпоинт генерации качественного живого мужского голоса без роботов
 @app.get("/api/tts")
 async def text_to_speech(text: str):
-    communicate = edge_tts.Communicate(text, voice="ru-RU-DmitryNeural", rate="+5%", pitch="-2Hz")
+    clean_text = re.sub(r"[*#`_~>\[\]]", "", text).strip()[:600]
+    communicate = edge_tts.Communicate(clean_text, voice="ru-RU-DmitryNeural", rate="+5%", pitch="-2Hz")
     audio_stream = io.BytesIO()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
@@ -312,37 +423,6 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-def call_opencode_deepseek(system_prompt: str, user_text: str, img_b64: str = None, mime: str = "image/jpeg") -> str:
-    user_content: Any = user_text
-    if img_b64:
-        user_content = [
-            {"type": "text", "text": user_text},
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}}
-        ]
-
-    body = {
-        "model": AI_MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ],
-        "temperature": 0.35
-    }
-
-    req = urllib.request.Request(
-        OPENCODE_BASE_URL,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENCODE_API_KEY}"
-        },
-        method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=45) as resp:
-        resp_data = json.loads(resp.read().decode("utf-8"))
-        return resp_data["choices"][0]["message"]["content"]
-
-
 @app.post("/api/ai-diagnose")
 async def ai_diagnose(
     prompt: str = Form(""),
@@ -389,13 +469,19 @@ async def ai_diagnose(
             img_b64,
             mime
         )
+        # Рассылаем озвучку ответа ИИ на ВСЕ открытые устройства
+        await manager.broadcast({
+            "type": "ai_broadcast",
+            "from_chat": True,
+            "text": reply_text
+        })
         return {"status": "ok", "model": AI_MODEL_NAME, "reply": reply_text}
     except Exception as e:
         return {
             "status": "error",
             "reply": (
                 f"**Ошибка соединения с ядром VECTOR AI ({AI_MODEL_NAME}).**\n"
-                f"Проверьте ключ `OPENCODE_API_KEY` в строке 20 файла `main.py`.\n*Детали: {str(e)}*"
+                f"Проверьте ключ `OPENCODE_API_KEY` в строке 22 файла `main.py`.\n*Детали: {str(e)}*"
             )
         }
 
@@ -475,10 +561,7 @@ if __name__ == "__main__":
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Вектор-Автоваз // VECTOR AI</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <!-- ============================================================================== -->
-  <!-- 🔑 МЕСТО ДЛЯ КЛЮЧА НА КАРТАТ (index.html): -->
-  <!-- - Строка 10: Вставьте ваш API-ключ Яндекс.Карт сразу после apikey= -->
-  <!-- ============================================================================== -->
+  <!-- 🔑 СТРОКА 9: ВСТАВИТЬ КЛЮЧ ЯНДЕКС КАРТ СРАЗУ ПОСЛЕ apikey= -->
   <script src="https://api-maps.yandex.ru/2.1/?apikey=ВСТАВИТЬ_КЛЮЧ_ЯНДЕКС_СЮДА&lang=ru_RU" type="text/javascript"></script>
   <style>
     :root {
@@ -547,8 +630,8 @@ if __name__ == "__main__":
     }
     .btn:hover { opacity: 0.9; box-shadow: 0 0 10px rgba(0,255,102,0.4); }
     .btn-purple { background: var(--purple); color: #fff; }
+    .btn-muted { background: #333; color: #ff2a5f; border: 1px solid #ff2a5f; }
 
-    /* Квадратная зелёная кнопка со скрепкой */
     .attach-btn {
       width: 42px; height: 42px; background: var(--accent); color: #000;
       border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;
@@ -605,6 +688,7 @@ if __name__ == "__main__":
     .msg { padding: 12px 16px; border-radius: 10px; max-width: 88%; line-height: 1.5; font-size: 14px; }
     .msg.user { background: rgba(0, 255, 102, 0.14); align-self: flex-end; color: #fff; border: 1px solid rgba(0,255,102,0.3); }
     .msg.ai { background: var(--card); align-self: flex-start; border-left: 3px solid var(--purple); }
+    .msg.ai.alert { border-left: 3px solid var(--danger); background: rgba(255, 42, 95, 0.12); }
     .msg.ai strong { color: var(--accent); font-weight: 700; }
     .msg.ai ul { margin: 6px 0 6px 20px; }
     .chat-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -686,7 +770,8 @@ if __name__ == "__main__":
         <div class="car-sub" id="uiSubInfo">ЭБУ: CAN 500 kbps (ATSP6) // Код: 0x00</div>
       </div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-        <button class="btn btn-purple" onclick="triggerEspVoice()">🔊 Голос (Диктор)</button>
+        <button class="btn" id="muteBtn" onclick="toggleMute()">🔊 Звук: ВКЛ</button>
+        <button class="btn btn-purple" onclick="triggerEspVoice()">🎙️ Озвучить статус</button>
         <div class="badge warn" id="uiStatusBadge">ОЖИДАНИЕ ДАННЫХ ЭБУ</div>
       </div>
     </div>
@@ -735,7 +820,7 @@ if __name__ == "__main__":
       <div class="chat-box" id="chatBox">
         <div class="msg ai">
           Здравствуйте! Я — бортовая нейросеть-диагност <strong>VECTOR AI</strong> для автомобилей <strong>АО «АВТОВАЗ»</strong>.<br>
-          Я непрерывно анализирую поток телеметрии с шины CAN, коды ЭБУ и вашу геопозицию. Задайте вопрос по состоянию узлов, прикрепите фото подкапотного пространства или запросите маршрут до ближайшего СТО.
+          Я непрерывно анализирую поток телеметрии с шины CAN, коды ЭБУ и вашу геопозицию. Все мои ответы и предупреждения автоматически озвучиваются голосом диктора.
         </div>
       </div>
       <div class="chat-controls">
@@ -891,6 +976,31 @@ if __name__ == "__main__":
     let arStream = null;
     let isAdminUnlocked = false;
     let currentAudio = null;
+    let isMuted = false;
+
+    function toggleMute() {
+      isMuted = !isMuted;
+      const btn = document.getElementById('muteBtn');
+      if (isMuted) {
+        btn.textContent = '🔇 Звук: ВЫКЛ';
+        btn.classList.add('btn-muted');
+        if (currentAudio) currentAudio.pause();
+      } else {
+        btn.textContent = '🔊 Звук: ВКЛ';
+        btn.classList.remove('btn-muted');
+      }
+    }
+
+    function speakText(rawText) {
+      if (isMuted || !rawText) return;
+      const clean = rawText.replace(/[*#`_~>\[\]]/g, '').trim().slice(0, 500);
+      if (!clean) return;
+      if (currentAudio) {
+        currentAudio.pause();
+      }
+      currentAudio = new Audio(`/api/tts?text=${encodeURIComponent(clean)}`);
+      currentAudio.play().catch(() => {});
+    }
 
     function updateFileBtnState(input) {
       const lbl = document.getElementById('attachBtnLabel');
@@ -1061,6 +1171,18 @@ if __name__ == "__main__":
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
         if (msg.state) updateUI(msg.state);
+
+        // Озвучка ответов ИИ и авто-предупреждений на ВСЕХ устройствах
+        if (msg.type === 'ai_broadcast' && msg.text) {
+          if (!msg.from_chat) {
+            const chat = document.getElementById('chatBox');
+            chat.innerHTML += `<div class="msg ai alert"><strong>⚠️ Авто-диагностика (${msg.title || 'Отклонение'}):</strong><br>${renderMarkdown(msg.text)}</div>`;
+            chat.scrollTop = chat.scrollHeight;
+            document.getElementById('anAiTips').innerHTML =
+              `<strong style="color:#ff2a5f;">⚠️ VECTOR AI (${msg.title || 'Отклонение'}):</strong> ${msg.text}`;
+          }
+          speakText(msg.text);
+        }
       };
       ws.onclose = () => {
         if (currentState) {
@@ -1108,22 +1230,15 @@ if __name__ == "__main__":
       }));
     }
 
-    // Воспроизведение качественного мужского живого голоса через серверный edge-tts
     function triggerEspVoice() {
       if (ws && ws.readyState === 1) {
         const track = (currentState && currentState.metrics.coolant_temp >= 106) ? 2 : 1;
         ws.send(JSON.stringify({ action: 'play_voice', track: track }));
       }
-
       const msg = (currentState && (currentState.metrics.rpm > 0 || currentState.metrics.voltage > 0))
         ? `Система Вектор Автоваз. Автомобиль ${currentState.car_name}. Статус: ${currentState.status}. Обороты ${currentState.metrics.rpm}, температура ${currentState.metrics.coolant_temp} градусов, бортсеть ${currentState.metrics.voltage} вольт.`
         : `Система Вектор Автоваз. Данные с ЭБУ не поступают, ожидание запуска.`;
-
-      if (currentAudio) {
-        currentAudio.pause();
-      }
-      currentAudio = new Audio(`/api/tts?text=${encodeURIComponent(msg)}`);
-      currentAudio.play();
+      speakText(msg);
     }
 
     async function sendAiRequest(customPrompt) {
@@ -1325,6 +1440,7 @@ if __name__ == "__main__":
           is_admin: true,
           status: 'ОЖИДАНИЕ ДАННЫХ ЭБУ',
           dtc_code: '0x00',
+          issue_text: 'Ожидание OBD-II',
           metrics: { rpm: 0, coolant_temp: 0, voltage: 0.0, fuel_level: 0, speed: 0 },
           log: 'Связь с ЭБУ отключена: все показатели сброшены в 0.'
         }));
@@ -1334,6 +1450,7 @@ if __name__ == "__main__":
           is_admin: true,
           status: 'СИСТЕМА В НОРМЕ',
           dtc_code: 'Ошибок нет (0x00)',
+          issue_text: 'Все в норме',
           metrics: { rpm: 840, coolant_temp: 89, voltage: 14.2, fuel_level: 65, speed: 45 },
           log: 'Штатный поток телеметрии LADA CAN.'
         }));
@@ -1343,6 +1460,7 @@ if __name__ == "__main__":
           is_admin: true,
           status: 'КРИТИЧЕСКИЙ ПЕРЕГРЕВ ДВС',
           dtc_code: 'P0217 (Высокая Т° ОЖ)',
+          issue_text: 'Перегрев ДВС',
           metrics: { rpm: 3100, coolant_temp: 115, voltage: 13.6, fuel_level: 62, speed: 30 },
           log: 'ВНИМАНИЕ! Зафиксирован перегрев ДВС (115 °C, код P0217)!'
         }));
@@ -1352,6 +1470,7 @@ if __name__ == "__main__":
           is_admin: true,
           status: 'ПРОТИВОРЕЧИЕ ДАННЫХ',
           dtc_code: 'ERR_CAN_SYNC',
+          issue_text: 'Сбой датчика скорости',
           metrics: { rpm: 0, coolant_temp: 88, voltage: 14.1, fuel_level: 60, speed: 65 },
           log: 'Фильтр достоверности: скорость 65 км/ч при 0 об/мин! Диагноз заблокирован.'
         }));
