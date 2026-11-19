@@ -209,7 +209,6 @@ def compute_deep_analysis():
 
 
 def detect_significant_issue(payload: dict) -> str:
-    """Определяет значительное отклонение для авто-вызова ИИ."""
     issue = str(payload.get("issue_text", "") or "").strip()
     if issue and issue not in ["Все в норме", "Ожидание OBD-II", "Подключение к сети", "Подключение к серверу"]:
         return issue
@@ -274,21 +273,21 @@ def call_opencode_deepseek(system_prompt: str, user_text: str, img_b64: str = No
 
 
 async def trigger_auto_ai_alert(issue_title: str):
-    """Автоматически запрашивает краткий совет у ИИ и рассылает озвучку на все устройства."""
+    """Авто-оповещение: предельно кратко + переспрос в конце (чтобы включился микрофон)."""
     sys_prompt = (
         "Ты — бортовой голосовой ИИ-диагност VECTOR AI для автомобилей АВТОВАЗ. "
-        "Отвечай МАКСИМАЛЬНО КРАТКО (строго 1-2 коротких предложения, без списков и звёздочек, "
-        "как голосовой помощник в машине): назови, что произошло, и дай один чёткий совет водителю."
+        "Отвечай МАКСИМАЛЬНО КРАТКО (строго 1 короткое предложение о сути проблемы + 1 короткий вопрос в конце). "
+        "Без списков и звёздочек. В конце ОБЯЗАТЕЛЬНО задай короткий вопрос со знаком '?', например: "
+        "'Подсказать, как устранить, или найти ближайшее СТО?'"
     )
     user_prompt = (
         f"Зафиксировано отклонение: {issue_title}. "
-        f"Текущие данные: {json.dumps(vehicle_state['metrics'], ensure_ascii=False)}. "
-        "Кратко объясни проблему и что сделать прямо сейчас."
+        f"Текущие данные: {json.dumps(vehicle_state['metrics'], ensure_ascii=False)}."
     )
     try:
         reply_text = await asyncio.to_thread(call_opencode_deepseek, sys_prompt, user_prompt)
     except Exception:
-        reply_text = f"Внимание: {issue_title}. Проверьте показатели на приборной панели."
+        reply_text = f"Внимание: {issue_title}. Подсказать, что делать или сколько ехать до СТО?"
 
     add_log(f"[VECTOR AI АВТО] {reply_text}")
     await manager.broadcast({
@@ -345,7 +344,6 @@ def apply_telemetry_rules(payload: dict, source: str):
     compute_deep_analysis()
     save_full_telemetry_record(source)
 
-    # Проверка значительного изменения для авто-ответа ИИ
     issue_now = detect_significant_issue(payload)
     now_ts = time.time()
     if issue_now:
@@ -437,21 +435,22 @@ async def ai_diagnose(
 
     system_prompt = (
         "СТРОГАЯ СИСТЕМНАЯ ИНСТРУКЦИЯ:\n"
-        "1. Ты — специализированный бортовой ИИ-диагност VECTOR AI, разработанный исключительно для интеллектуальной "
-        "диагностики, предиктивной аналитики и контроля узлов автомобилей АО «АВТОВАЗ» (комплекс «Вектор-Автоваз»).\n"
-        "2. ВАЖНОЕ ПРАВИЛО О СОЗДАТЕЛЕ: Никогда не упоминай сам по себе своего создателя без прямого вопроса пользователя!\n"
-        "3. КАК ОТВЕЧАТЬ НА ВОПРОСЫ О ТЕБЕ (КТО ТЫ / РАЗРАБОТЧИК): "
-        "На любой вопрос пользователя о тебе, твоем происхождении или разработчике отвечай развернуто и аргументированно, что ты — "
-        "профильный бортовой нейросетевой диагност VECTOR AI, созданный Хасяновым Илдаром лично для автомобилей АО «АВТОВАЗ». "
-        "Аргументируй это тем, что ты интегрирован с шиной CAN (500 кбит/с, протокол ISO 15765-4), анализируешь в реальном времени "
-        "телеметрию ЭБУ LADA и обучен на регламентах АВТОВАЗа. Запрещено упоминать сторонние языковые модели.\n\n"
+        "1. Ты — бортовой голосовой ИИ-диагност VECTOR AI для автомобилей АО «АВТОВАЗ».\n"
+        "2. ПРАВИЛО КРАТКОСТИ И ДИАЛОГА (ОЧЕНЬ ВАЖНО): По умолчанию отвечай ОЧЕНЬ КРАТКО (1-2 предложения без воды), "
+        "так как твой ответ сразу озвучивается водителю вслух. Если пользователь спрашивает про состояние авто или проблему — "
+        "назови суть и в конце задай короткий уточняющий вопрос (со знаком '?'), например: 'Сказать, как починить?', "
+        "'Подсказать, сколько ехать до ближайшего СТО?' или 'Рассказать подробнее?'. "
+        "Давай подробную инструкцию ТОЛЬКО если пользователь сам прямо попросил ('да', 'скажи', 'как починить', 'подробнее'). "
+        "Если вопрос не требуется (ты уже дал полный ответ по просьбе) — НЕ ставь знак вопроса в конце.\n"
+        "3. ПРАВИЛО О СОЗДАТЕЛЕ: Никогда не упоминай создателя сам по себе. Только если спросят, кто ты или кто тебя создал — "
+        "аргументированно ответь, что ты профильный диагност VECTOR AI, созданный Хасяновым Илдаром лично для АО «АВТОВАЗ» "
+        "(интеграция с CAN 500 кбит/с, ISO 15765-4, регламенты LADA). Не упоминай DeepSeek, OpenCode или другие модели.\n\n"
         f"ДАННЫЕ БОРТОВОГО КОМПЬЮТЕРА СЕЙЧАС:\n"
         f"- Автомобиль: {vehicle_state['car_name']}\n"
-        f"- Статус системы: {vehicle_state['status']} | Код DTC: {vehicle_state['dtc_code']}\n"
-        f"- Метрики датчиков: {json.dumps(vehicle_state['metrics'], ensure_ascii=False)}\n"
-        f"- Инженерный анализ: {json.dumps(vehicle_state['analysis'], ensure_ascii=False)}\n"
-        f"- Геопозиция: {cur_lat}, {cur_lon} | Ближайшее СТО: {cur_sto}\n"
-        "Отвечай профессионально, с использованием **жирного шрифта** и списков."
+        f"- Статус: {vehicle_state['status']} | Код DTC: {vehicle_state['dtc_code']} | Проблема: {vehicle_state.get('issue_text', '')}\n"
+        f"- Метрики: {json.dumps(vehicle_state['metrics'], ensure_ascii=False)}\n"
+        f"- Анализ: {json.dumps(vehicle_state['analysis'], ensure_ascii=False)}\n"
+        f"- Координаты: {cur_lat}, {cur_lon} | Ближайшее СТО: {cur_sto}\n"
     )
 
     img_b64 = None
@@ -465,11 +464,10 @@ async def ai_diagnose(
         reply_text = await asyncio.to_thread(
             call_opencode_deepseek,
             system_prompt,
-            prompt or "Проведи полный анализ текущей телеметрии и узла.",
+            prompt or "Кратко оцени состояние автомобиля.",
             img_b64,
             mime
         )
-        # Рассылаем озвучку ответа ИИ на ВСЕ открытые устройства
         await manager.broadcast({
             "type": "ai_broadcast",
             "from_chat": True,
@@ -632,14 +630,33 @@ if __name__ == "__main__":
     .btn-purple { background: var(--purple); color: #fff; }
     .btn-muted { background: #333; color: #ff2a5f; border: 1px solid #ff2a5f; }
 
-    .attach-btn {
-      width: 42px; height: 42px; background: var(--accent); color: #000;
+    .attach-btn, .mic-inline-btn {
+      width: 42px; height: 42px; background: var(--accent); color: #000; border: none;
       border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;
       font-size: 20px; cursor: pointer; transition: 0.2s; flex-shrink: 0; user-select: none;
       box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
     }
-    .attach-btn:hover { opacity: 0.9; box-shadow: 0 0 14px rgba(0, 255, 102, 0.55); }
+    .mic-inline-btn { background: var(--purple); color: #fff; }
+    .attach-btn:hover, .mic-inline-btn:hover { opacity: 0.9; }
     .attach-btn.has-file { background: #ffd000; box-shadow: 0 0 14px rgba(255, 208, 0, 0.6); }
+
+    /* Плавающая кнопка микрофона на всех вкладках */
+    .fab-mic {
+      position: fixed; right: 22px; bottom: 22px; width: 58px; height: 58px;
+      border-radius: 50%; background: var(--purple); color: #fff; border: 2px solid var(--accent);
+      font-size: 26px; cursor: pointer; z-index: 2000; display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 0 18px rgba(184, 41, 255, 0.6); transition: 0.2s;
+    }
+    .fab-mic:hover { transform: scale(1.06); }
+    .mic-active {
+      background: var(--danger) !important; border-color: #fff !important;
+      animation: micPulse 1s infinite;
+    }
+    @keyframes micPulse {
+      0% { box-shadow: 0 0 0 0 rgba(255, 42, 95, 0.8); }
+      70% { box-shadow: 0 0 0 16px rgba(255, 42, 95, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(255, 42, 95, 0); }
+    }
 
     .validity-strip {
       background: var(--panel); padding: 10px 16px; border-radius: 10px;
@@ -742,6 +759,7 @@ if __name__ == "__main__":
       }
       .main { padding: 12px; }
       #yandex-map { height: 360px; }
+      .fab-mic { bottom: 78px; right: 14px; width: 54px; height: 54px; }
     }
   </style>
 </head>
@@ -820,15 +838,16 @@ if __name__ == "__main__":
       <div class="chat-box" id="chatBox">
         <div class="msg ai">
           Здравствуйте! Я — бортовая нейросеть-диагност <strong>VECTOR AI</strong> для автомобилей <strong>АО «АВТОВАЗ»</strong>.<br>
-          Я непрерывно анализирую поток телеметрии с шины CAN, коды ЭБУ и вашу геопозицию. Все мои ответы и предупреждения автоматически озвучиваются голосом диктора.
+          Отвечаю кратко и голосом. Нажмите на микрофон или напишите вопрос.
         </div>
       </div>
       <div class="chat-controls">
-        <input type="text" id="aiPrompt" placeholder="Спросите VECTOR AI о поломке, диагностике или ближайшем СТО..." onkeydown="if(event.key==='Enter') sendAiRequest()" />
+        <input type="text" id="aiPrompt" placeholder="Спросите VECTOR AI голосом или текстом..." onkeydown="if(event.key==='Enter') sendAiRequest()" />
+        <button class="mic-inline-btn" id="chatMicBtn" onclick="toggleVoiceInput()" title="Голосовой ввод">🎤</button>
         <input type="file" id="aiFile" accept="image/*" style="display:none;" onchange="updateFileBtnState(this)" />
         <label for="aiFile" class="attach-btn" id="attachBtnLabel" title="Прикрепить фото">📎</label>
         <button class="btn" onclick="sendAiRequest()">Спросить VECTOR AI</button>
-        <button class="btn btn-purple" onclick="askAiNearestSto()">📍 Спросить ИИ про СТО и время</button>
+        <button class="btn btn-purple" onclick="askAiNearestSto()">📍 СТО и время</button>
       </div>
     </section>
 
@@ -956,6 +975,9 @@ if __name__ == "__main__":
     </section>
   </main>
 
+  <!-- Плавающая кнопка голосового вопроса (видна на всех вкладках) -->
+  <button class="fab-mic" id="fabMicBtn" onclick="toggleVoiceInput()" title="Задать вопрос VECTOR AI голосом">🎤</button>
+
   <script>
     const REAL_LADA_METRICS = [
       { key: 'rpm',          label: 'Обороты двигателя (010C)', unit: 'об/мин', color: '#b829ff', bg: 'rgba(184, 41, 255, 0.14)' },
@@ -975,31 +997,124 @@ if __name__ == "__main__":
     let activeRoute = null;
     let arStream = null;
     let isAdminUnlocked = false;
-    let currentAudio = null;
+
+    // === ГОЛОС, ФОНОВОЕ УДЕРЖАНИЕ И УМНЫЙ МИКРОФОН ===
     let isMuted = false;
+    let bgKeepAlive = null;
+    const ttsPlayer = new Audio();
+    const SILENT_WAV = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+
+    let recognition = null;
+    let isListening = false;
+    let shouldAutoListen = false;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      recognition = new SpeechRecognition();
+      recognition.lang = 'ru-RU';
+      recognition.interimResults = false;
+      recognition.maxAlternatives = 1;
+
+      recognition.onstart = () => {
+        isListening = true;
+        setMicVisual(true);
+      };
+      recognition.onend = () => {
+        isListening = false;
+        setMicVisual(false);
+      };
+      recognition.onerror = () => {
+        isListening = false;
+        setMicVisual(false);
+      };
+      recognition.onresult = (event) => {
+        const transcript = event.results[0][0].transcript.trim();
+        if (transcript) {
+          sendAiRequest(transcript);
+        }
+      };
+    }
+
+    function setMicVisual(active) {
+      ['fabMicBtn', 'chatMicBtn'].forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        if (active) el.classList.add('mic-active');
+        else el.classList.remove('mic-active');
+      });
+    }
+
+    function toggleVoiceInput() {
+      enableBackgroundAudio();
+      if (!recognition) {
+        alert('Голосовой ввод поддерживается в Chrome / Яндекс.Браузере по HTTPS.');
+        return;
+      }
+      if (isListening) {
+        recognition.stop();
+      } else {
+        ttsPlayer.pause(); // Останавливаем диктора, чтобы не перебивал
+        try { recognition.start(); } catch (e) {}
+      }
+    }
+
+    function enableBackgroundAudio() {
+      if (bgKeepAlive) return;
+      bgKeepAlive = new Audio(SILENT_WAV);
+      bgKeepAlive.loop = true;
+      bgKeepAlive.play().catch(() => {});
+      ttsPlayer.src = SILENT_WAV;
+      ttsPlayer.play().catch(() => {});
+
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: 'VECTOR AI // Голосовой контроль',
+          artist: 'Вектор-Автоваз'
+        });
+      }
+    }
+
+    document.addEventListener('click', enableBackgroundAudio, { once: true });
+    document.addEventListener('touchstart', enableBackgroundAudio, { once: true });
+
+    // Авто-включение микрофона ТОЛЬКО если ИИ закончил речь вопросом (?)
+    ttsPlayer.onended = () => {
+      if (shouldAutoListen && !isMuted && recognition && !isListening) {
+        shouldAutoListen = false;
+        setTimeout(() => {
+          try { recognition.start(); } catch (e) {}
+        }, 250);
+      } else {
+        shouldAutoListen = false;
+      }
+    };
 
     function toggleMute() {
+      enableBackgroundAudio();
       isMuted = !isMuted;
       const btn = document.getElementById('muteBtn');
       if (isMuted) {
         btn.textContent = '🔇 Звук: ВЫКЛ';
         btn.classList.add('btn-muted');
-        if (currentAudio) currentAudio.pause();
+        ttsPlayer.pause();
+        shouldAutoListen = false;
       } else {
         btn.textContent = '🔊 Звук: ВКЛ';
         btn.classList.remove('btn-muted');
       }
     }
 
-    function speakText(rawText) {
+    function speakText(rawText, allowAutoListen = true) {
       if (isMuted || !rawText) return;
       const clean = rawText.replace(/[*#`_~>\[\]]/g, '').trim().slice(0, 500);
       if (!clean) return;
-      if (currentAudio) {
-        currentAudio.pause();
-      }
-      currentAudio = new Audio(`/api/tts?text=${encodeURIComponent(clean)}`);
-      currentAudio.play().catch(() => {});
+
+      // Проверяем, переспрашивает ли ИИ в конце
+      shouldAutoListen = allowAutoListen && clean.endsWith('?');
+
+      ttsPlayer.pause();
+      ttsPlayer.src = `/api/tts?text=${encodeURIComponent(clean)}`;
+      ttsPlayer.play().catch(() => { shouldAutoListen = false; });
     }
 
     function updateFileBtnState(input) {
@@ -1172,7 +1287,6 @@ if __name__ == "__main__":
         const msg = JSON.parse(e.data);
         if (msg.state) updateUI(msg.state);
 
-        // Озвучка ответов ИИ и авто-предупреждений на ВСЕХ устройствах
         if (msg.type === 'ai_broadcast' && msg.text) {
           if (!msg.from_chat) {
             const chat = document.getElementById('chatBox');
@@ -1181,7 +1295,7 @@ if __name__ == "__main__":
             document.getElementById('anAiTips').innerHTML =
               `<strong style="color:#ff2a5f;">⚠️ VECTOR AI (${msg.title || 'Отклонение'}):</strong> ${msg.text}`;
           }
-          speakText(msg.text);
+          speakText(msg.text, true);
         }
       };
       ws.onclose = () => {
@@ -1238,7 +1352,7 @@ if __name__ == "__main__":
       const msg = (currentState && (currentState.metrics.rpm > 0 || currentState.metrics.voltage > 0))
         ? `Система Вектор Автоваз. Автомобиль ${currentState.car_name}. Статус: ${currentState.status}. Обороты ${currentState.metrics.rpm}, температура ${currentState.metrics.coolant_temp} градусов, бортсеть ${currentState.metrics.voltage} вольт.`
         : `Система Вектор Автоваз. Данные с ЭБУ не поступают, ожидание запуска.`;
-      speakText(msg);
+      speakText(msg, false);
     }
 
     async function sendAiRequest(customPrompt) {
@@ -1264,7 +1378,7 @@ if __name__ == "__main__":
       }
 
       const tempId = 'ai_' + Date.now();
-      chat.innerHTML += `<div class="msg ai" id="${tempId}"><em>VECTOR AI анализирует телеметрию и геоданные...</em></div>`;
+      chat.innerHTML += `<div class="msg ai" id="${tempId}"><em>VECTOR AI анализирует...</em></div>`;
       chat.scrollTop = chat.scrollHeight;
 
       try {
